@@ -21,6 +21,7 @@
 #if defined(__SWITCH__)
 #include "platform/switch/SwitchMemoryBudget.h"
 #include "platform/switch/SwitchPlatform.h"
+void SwitchRendererThreadExit();
 #endif
 
 LatteGPUState_t LatteGPUState = {};
@@ -316,6 +317,9 @@ void LatteThread_Exit()
 		delete renderer;
 		g_renderer.release();
 	}
+#if defined(__SWITCH__)
+	SwitchRendererThreadExit();
+#endif
 	// reset GPU7 state
 	std::memset(&LatteGPUState, 0, sizeof(LatteGPUState));
 	#if BOOST_OS_WINDOWS

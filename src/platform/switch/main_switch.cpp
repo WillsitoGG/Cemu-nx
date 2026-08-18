@@ -1,6 +1,8 @@
 #include <switch.h>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <exception>
 
 #include "WindowSystem.h"
 #include "Common/ExceptionHandler/ExceptionHandler.h"
@@ -27,6 +29,23 @@ namespace
 {
 	constexpr size_t kHeapAlignment = 0x200000;
 	constexpr size_t kApplicationReserve = 96 * 1024 * 1024;
+	constexpr const char* kLastCoreErrorPath = "sdmc:/switch/cemu/last-core-error.log";
+
+	void WriteLastCoreError(const char* stage, const char* detail)
+	{
+		FILE* file = std::fopen(kLastCoreErrorPath, "w");
+		if (!file)
+			return;
+		std::fprintf(file, "stage=%s\n", stage ? stage : "unknown");
+		std::fprintf(file, "detail=%s\n", detail ? detail : "unknown");
+		std::fprintf(file, "inherited_heap=%zu\n", g_switchInheritedHeapSize);
+		std::fprintf(file, "total_heap=%zu\n", g_switchHeapTotalSize);
+		std::fprintf(file, "newlib_heap=%zu\n", g_switchNewlibHeapSize);
+		std::fprintf(file, "guest_pool=%zu\n", g_switchGuestPoolSize);
+		std::fprintf(file, "heap_expansion_attempted=%d\n", g_switchHeapExpansionAttempted ? 1 : 0);
+		std::fprintf(file, "heap_expansion_result=0x%08x\n", static_cast<unsigned>(g_switchHeapExpansionResult));
+		std::fclose(file);
+	}
 
 	bool RecoverGuestPoolFromApplicationHeap(char* overrideBase, size_t overrideSize)
 	{
@@ -187,11 +206,27 @@ static void SwitchPlatformExit()
 int main(int argc, char* argv[])
 {
 	const bool platformInitialized = SwitchPlatformInit();
-	if (!platformInitialized || !LaunchSettings::HandleCommandline(argc, argv))
+	if (!platformInitialized)
 	{
+		WriteLastCoreError("platform", "platform initialization failed");
 		SwitchPlatformExit();
 		std::_Exit(EXIT_FAILURE);
 	}
+
+	// A disengaged optional means that parsing succeeded and normal emulation
+	// should continue.  A value is an explicit early-exit status (for example,
+	// --help, --version, or a command-line parse error).
+	if (const std::optional<int> commandLineResult = LaunchSettings::HandleCommandline(argc, argv);
+		commandLineResult.has_value())
+	{
+		if (*commandLineResult == EXIT_SUCCESS)
+			std::remove(kLastCoreErrorPath);
+		else
+			WriteLastCoreError("platform", "invalid command line");
+		SwitchPlatformExit();
+		std::_Exit(*commandLineResult);
+	}
+	std::remove(kLastCoreErrorPath);
 
 	int status = EXIT_SUCCESS;
 	try
@@ -199,8 +234,14 @@ int main(int argc, char* argv[])
 		ExceptionHandler_Init();
 		WindowSystem::Create();
 	}
+	catch (const std::exception& exception)
+	{
+		WriteLastCoreError("window", exception.what());
+		status = EXIT_FAILURE;
+	}
 	catch (...)
 	{
+		WriteLastCoreError("window", "unknown exception");
 		status = EXIT_FAILURE;
 	}
 

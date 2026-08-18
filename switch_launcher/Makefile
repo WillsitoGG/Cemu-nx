@@ -1,9 +1,15 @@
 # Cemu launcher for Nintendo Switch.
 .SUFFIXES:
+.DEFAULT_GOAL := all
 
 ifeq ($(strip $(DEVKITPRO)),)
 $(error "Please set DEVKITPRO in your environment. export DEVKITPRO=<path to>/devkitpro")
 endif
+
+APP_TITLE	:=	Cemu
+APP_AUTHOR	:=	naga
+RELEASE_VERSION	?=	1.1.3
+APP_VERSION	?=	$(RELEASE_VERSION)
 
 TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
@@ -18,11 +24,6 @@ INCLUDES	:=	include ../src/platform/switch/common \
 			../build_switch/_deps/libusbhsfs-src/include
 ROMFS		:=	romfs		# emulator and forwarder payloads
 ICON		:=	Cemu.jpg
-
-APP_TITLE	:=	Cemu
-APP_AUTHOR	:=	naga
-RELEASE_VERSION	?=	1.1.2
-APP_VERSION	?=	$(RELEASE_VERSION)
 
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 

@@ -41,9 +41,11 @@
 #include <fstream>
 #include <map>
 #include <stdexcept>
+#include <string_view>
 
 void PPCTimer_init();
-bool SwitchCreateRenderer(int width, int height);
+bool SwitchCreateRenderer(int width, int height, std::string_view backend);
+void SwitchDestroyRenderer();
 
 namespace
 {
@@ -58,6 +60,7 @@ namespace
 	std::atomic<SwitchGamePadLayout> s_gamePadLayout{SwitchGamePadLayout::Disabled};
 	std::atomic<SwitchGamePadLayout> s_lastCompositeLayout{SwitchGamePadLayout::Right};
 	std::atomic_bool s_gamePadLayoutChanged{false};
+	std::string s_rendererBackend{"vk"};
 
 	constexpr uint64_t kGameBootBoostHandoffTimeoutNs = 300'000'000'000ULL;
 
@@ -437,10 +440,14 @@ namespace WindowSystem
 			n_config.Load();
 
 		LoadHandoff();
+		const std::string requestedRenderer = Handoff("renderer", "vk");
+		s_rendererBackend = requestedRenderer == "gl" || requestedRenderer == "zink" ?
+			requestedRenderer : "vk";
+		GetConfig().graphic_api = s_rendererBackend == "vk" ? kVulkan : kOpenGL;
 		const std::string lsfgEnabled = Handoff("lsfg_enabled", "false");
 		const std::string lsfgPerformance = Handoff("lsfg_performance", "true");
 		SwitchLSFG_Configure(
-			lsfgEnabled == "true" || lsfgEnabled == "1",
+			s_rendererBackend == "vk" && (lsfgEnabled == "true" || lsfgEnabled == "1"),
 			std::strtof(Handoff("lsfg_flow_scale", "0.25").c_str(), nullptr),
 			lsfgPerformance != "false" && lsfgPerformance != "0");
 		if (int shift = atoi(Handoff("timer_shift", "3").c_str()); shift >= 0 && shift <= 7)
@@ -513,6 +520,7 @@ namespace WindowSystem
 			CafeSystem::Shutdown();
 			s_cafeInitialized = false;
 		}
+		SwitchDestroyRenderer();
 		if (s_saveListInitialized)
 		{
 			CafeSaveList::Shutdown();
@@ -574,8 +582,9 @@ namespace WindowSystem
 	static bool LaunchPreparedTitle()
 	{
 		if (!SwitchCreateRenderer(s_surfaceWidth.load(std::memory_order_acquire),
-		                          s_surfaceHeight.load(std::memory_order_acquire)))
-			throw std::runtime_error("failed to initialize the Vulkan renderer");
+		                          s_surfaceHeight.load(std::memory_order_acquire),
+		                          s_rendererBackend))
+			throw std::runtime_error("failed to initialize graphics renderer: " + s_rendererBackend);
 		CafeSystem::LaunchForegroundTitle();
 		return true;
 	}

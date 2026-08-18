@@ -166,8 +166,12 @@ set(glslang_VERSION "15.1.0")
 
 # The top-level build adds ZArchive after package discovery fails.
 
-# Mesa NVK Vulkan driver
-set(NVK_DIR "${CMAKE_SOURCE_DIR}/dependencies/switch_mesa_vulkan")
+# Mesa NVK Vulkan driver.  Accept both the historical NVK-only package and the
+# unified Horizon Mesa SDK.  The latter is intentionally selected explicitly so
+# a developer's system portlibs can never silently change a release build.
+set(SWITCH_MESA_SDK_ROOT "${CMAKE_SOURCE_DIR}/dependencies/switch_mesa_vulkan"
+	CACHE PATH "Path to the extracted Mesa Switch SDK")
+set(NVK_DIR "${SWITCH_MESA_SDK_ROOT}")
 set(NVK_LOCAL "${NVK_DIR}/libnvk_local.o")
 if(NOT EXISTS "${NVK_LOCAL}")
 	message(FATAL_ERROR
@@ -176,13 +180,29 @@ if(NOT EXISTS "${NVK_LOCAL}")
 		"See dist/switch/README.md.")
 endif()
 
+# libEGL uses NVK's loaderless entrypoints for Zink.  The object and archive
+# contain the same localized public Vulkan API with Mesa's internal Horizon
+# runtime left global, so native Vulkan, EGL and Zink share one lifetime graph.
+set(SWITCH_MESA_LOCAL_VULKAN_ARCHIVE
+	"${SWITCH_MESA_SDK_ROOT}/libnvk_local.a")
+if(NOT EXISTS "${SWITCH_MESA_LOCAL_VULKAN_ARCHIVE}")
+	message(FATAL_ERROR
+		"Localized Mesa Vulkan archive not found: ${SWITCH_MESA_LOCAL_VULKAN_ARCHIVE}")
+endif()
+set(OPENGL_SWITCH_VULKAN_LIBRARY "${SWITCH_MESA_LOCAL_VULKAN_ARCHIVE}")
+list(PREPEND CMAKE_PREFIX_PATH "${SWITCH_MESA_SDK_ROOT}")
+
 add_library(SwitchVulkanDriver INTERFACE)
 target_include_directories(SwitchVulkanDriver INTERFACE
-	"${CMAKE_SOURCE_DIR}/dependencies/Vulkan-Headers/include")
+	"${CMAKE_SOURCE_DIR}/dependencies/Vulkan-Headers/include"
+	"${NVK_DIR}/include")
 target_link_libraries(SwitchVulkanDriver INTERFACE
 	"${NVK_LOCAL}"
 	# Mesa 26.2 NVK parses cubin metadata through libelf.
 	"${SWITCH_PORTLIBS}/lib/libelf.a"
+	"${SWITCH_PORTLIBS}/lib/libexpat.a"
+	"${SWITCH_PORTLIBS}/lib/libzstd.a"
+	"${SWITCH_PORTLIBS}/lib/libz.a"
 	# The nouveau winsys provides NVHOST and NVMAP access.
 	"${SWITCH_PORTLIBS}/lib/libdrm_nouveau.a")
 
@@ -230,7 +250,77 @@ set(USBHSFS_NTFS OFF CACHE BOOL "" FORCE)
 set(USBHSFS_EXT4 OFF CACHE BOOL "" FORCE)
 set(USBHSFS_SXOS_DISABLE ON CACHE BOOL "" FORCE)
 set(USBHSFS_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+# Keep the UASP patch set tied to the exact libusbhsfs tree it was audited
+# against. This also prevents a caller-provided FetchContent source from
+# silently applying the transport changes to an incompatible revision.
+set(_cemu_libusbhsfs_pinned_revision 625269b7725a6e2a3f2724e8d45b602c1b20ead5)
 FetchContent_Declare(libusbhsfs
 	GIT_REPOSITORY https://github.com/ITotalJustice/libusbhsfs.git
-	GIT_TAG 625269b7725a6e2a3f2724e8d45b602c1b20ead5)
+	GIT_TAG ${_cemu_libusbhsfs_pinned_revision})
 FetchContent_MakeAvailable(libusbhsfs)
+
+find_package(Git REQUIRED)
+execute_process(
+	COMMAND "${GIT_EXECUTABLE}"
+		-c "safe.directory=${libusbhsfs_SOURCE_DIR}"
+		rev-parse HEAD
+	WORKING_DIRECTORY "${libusbhsfs_SOURCE_DIR}"
+	RESULT_VARIABLE _cemu_libusbhsfs_revision_result
+	OUTPUT_VARIABLE _cemu_libusbhsfs_revision
+	OUTPUT_STRIP_TRAILING_WHITESPACE
+	ERROR_QUIET)
+if(NOT _cemu_libusbhsfs_revision_result EQUAL 0 OR
+	NOT "${_cemu_libusbhsfs_revision}" STREQUAL "${_cemu_libusbhsfs_pinned_revision}")
+	message(FATAL_ERROR
+		"libusbhsfs source is not the pinned ${_cemu_libusbhsfs_pinned_revision} revision")
+endif()
+
+# Apply the verified Dolphin/Nether UASP command/status-IU transport, BOT
+# fallback and reset cleanup. Forward and reverse checks keep reconfiguration
+# idempotent while still failing on an unexpected source tree.
+set(_cemu_libusbhsfs_uasp_dir "${CMAKE_SOURCE_DIR}/dist/switch/libusbhsfs")
+set(_cemu_libusbhsfs_uasp_patches
+	"${_cemu_libusbhsfs_uasp_dir}/0001-add-uasp-transport-hooks.patch"
+	"${_cemu_libusbhsfs_uasp_dir}/0002-fallback-to-bot-interface.patch"
+	"${_cemu_libusbhsfs_uasp_dir}/0003-cleanup-after-uasp-reset.patch")
+foreach(_cemu_libusbhsfs_patch IN LISTS _cemu_libusbhsfs_uasp_patches)
+	execute_process(
+		COMMAND "${GIT_EXECUTABLE}"
+			-c "safe.directory=${libusbhsfs_SOURCE_DIR}"
+			apply --ignore-space-change --check "${_cemu_libusbhsfs_patch}"
+		WORKING_DIRECTORY "${libusbhsfs_SOURCE_DIR}"
+		RESULT_VARIABLE _cemu_libusbhsfs_patch_check
+		OUTPUT_QUIET ERROR_QUIET)
+	if(_cemu_libusbhsfs_patch_check EQUAL 0)
+		execute_process(
+			COMMAND "${GIT_EXECUTABLE}"
+				-c "safe.directory=${libusbhsfs_SOURCE_DIR}"
+				apply --ignore-space-change "${_cemu_libusbhsfs_patch}"
+			WORKING_DIRECTORY "${libusbhsfs_SOURCE_DIR}"
+			RESULT_VARIABLE _cemu_libusbhsfs_patch_result)
+		if(NOT _cemu_libusbhsfs_patch_result EQUAL 0)
+			message(FATAL_ERROR "Failed to apply ${_cemu_libusbhsfs_patch}")
+		endif()
+	else()
+		execute_process(
+			COMMAND "${GIT_EXECUTABLE}"
+				-c "safe.directory=${libusbhsfs_SOURCE_DIR}"
+				apply --ignore-space-change --reverse --check "${_cemu_libusbhsfs_patch}"
+			WORKING_DIRECTORY "${libusbhsfs_SOURCE_DIR}"
+			RESULT_VARIABLE _cemu_libusbhsfs_patch_reverse_check
+			OUTPUT_QUIET ERROR_QUIET)
+		if(NOT _cemu_libusbhsfs_patch_reverse_check EQUAL 0)
+			message(FATAL_ERROR
+				"The pinned libusbhsfs source does not match ${_cemu_libusbhsfs_patch}")
+		endif()
+	endif()
+endforeach()
+
+target_sources(libusbhsfs PRIVATE
+	"${_cemu_libusbhsfs_uasp_dir}/usbhsfs_uasp.c"
+	"${_cemu_libusbhsfs_uasp_dir}/usbhsfs_uasp.h")
+target_include_directories(libusbhsfs PRIVATE
+	"${_cemu_libusbhsfs_uasp_dir}"
+	"${libusbhsfs_SOURCE_DIR}/source")
+target_compile_definitions(libusbhsfs PRIVATE get_fattime=usbhsfs_get_fattime)

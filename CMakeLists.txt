@@ -212,7 +212,18 @@ if (ENABLE_VULKAN)
 endif()
 
 if (ENABLE_OPENGL)
-	find_package(OpenGL REQUIRED)
+	if(PLATFORM_SWITCH)
+		if(NOT IS_DIRECTORY "${SWITCH_MESA_SDK_ROOT}/lib/cmake/OpenGL")
+			message(FATAL_ERROR
+				"The Switch OpenGL backend requires the complete unified Mesa SDK at "
+				"${SWITCH_MESA_SDK_ROOT}")
+		endif()
+		find_package(OpenGL CONFIG REQUIRED
+			PATHS "${SWITCH_MESA_SDK_ROOT}/lib/cmake/OpenGL"
+			NO_DEFAULT_PATH)
+	else()
+		find_package(OpenGL REQUIRED)
+	endif()
 	add_compile_definitions(ENABLE_OPENGL)
 endif()
 

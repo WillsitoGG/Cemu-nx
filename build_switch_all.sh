@@ -2,7 +2,7 @@
 set -euo pipefail
 
 BUILD_JOBS="${BUILD_JOBS:-18}"
-RELEASE_VERSION="${RELEASE_VERSION:-1.1.2}"
+RELEASE_VERSION="${RELEASE_VERSION:-1.1.3}"
 case "${BUILD_JOBS}" in
 	''|*[!0-9]*|0) echo "BUILD_JOBS must be a positive integer" >&2; exit 2 ;;
 esac
@@ -19,9 +19,14 @@ RELEASE_VERSION="$RELEASE_VERSION" BUILD_JOBS="$BUILD_JOBS" bash "$ROOT/dist/swi
 
 echo "[2/4] Staging the emulator"
 mkdir -p "$ROOT/switch_launcher/romfs/emu"
-rm -f "$ROOT/switch_launcher/romfs/emu/cemu_vk.nro"
-cp -f "$ROOT/bin/cemu_core.nro" "$ROOT/switch_launcher/romfs/emu/cemu_vk.nro"
-sha256sum "$ROOT/switch_launcher/romfs/emu/cemu_vk.nro" | awk '{print $1}' > "$ROOT/switch_launcher/romfs/emu/cemu_vk.sha256"
+rm -f "$ROOT/switch_launcher/romfs/emu/cemu_vk.nro" \
+	"$ROOT/switch_launcher/romfs/emu/cemu_vk.sha256" \
+	"$ROOT/switch_launcher/romfs/emu/cemu_gl.nro" \
+	"$ROOT/switch_launcher/romfs/emu/cemu_gl.sha256" \
+	"$ROOT/switch_launcher/romfs/emu/cemu_zink.nro" \
+	"$ROOT/switch_launcher/romfs/emu/cemu_zink.sha256"
+cp -f "$ROOT/bin/cemu_core.nro" "$ROOT/switch_launcher/romfs/emu/cemu_core.nro"
+sha256sum "$ROOT/switch_launcher/romfs/emu/cemu_core.nro" | awk '{print $1}' > "$ROOT/switch_launcher/romfs/emu/cemu_core.sha256"
 
 echo "[3/4] Building the HOME Menu forwarder"
 make -C "$ROOT/switch_launcher/fwd" VERSION="$RELEASE_VERSION" clean

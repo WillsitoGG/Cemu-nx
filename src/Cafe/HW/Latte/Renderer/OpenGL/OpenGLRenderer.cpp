@@ -19,6 +19,13 @@
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "Cafe/OS/libs/gx2/GX2.h"
 
+#include <stdexcept>
+
+#if defined(__SWITCH__)
+#include "platform/switch/SwitchPlatform.h"
+#include <EGL/egl.h>
+#endif
+
 class DefaultOpenGLCanvasCallbacks : public OpenGLCanvasCallbacks
 {
 } g_defaultOpenGLCanvasCallbacks;
@@ -288,6 +295,21 @@ EGLAPI EGLBoolean EGLAPIENTRY eglSwapInterval(EGLDisplay dpy, EGLint interval)
 }
 #endif
 
+#elif defined(__SWITCH__)
+void LoadOpenGLImports()
+{
+#define GLFUNC(__type, __name) __name = reinterpret_cast<__type>(::eglGetProcAddress(STRINGIFY(__name)));
+#define EGLFUNC(__type, __name) __name = reinterpret_cast<__type>(::eglGetProcAddress(STRINGIFY(__name)));
+#include "Common/GLInclude/glFunctions.h"
+#undef GLFUNC
+#undef EGLFUNC
+
+	if (!glGetString || !glCreateShader || !glCreateProgram || !glGenBuffers ||
+		!glBindFramebuffer || !glDrawRangeElements)
+	{
+		throw std::runtime_error("the selected Mesa backend does not expose the required OpenGL API");
+	}
+}
 #elif BOOST_OS_MACOS
 void LoadOpenGLImports()
 {
@@ -484,8 +506,17 @@ void OpenGLRenderer::SwapBuffers(bool swapTV, bool swapDRC)
 {
 	GLCanvas_SwapBuffers(swapTV, swapDRC);
 
-	if (swapTV)
+	if (swapTV
+#if defined(__SWITCH__)
+		|| (SwitchPlatform_IsGamePadOutputActive() && swapDRC)
+#endif
+	)
+	{
 		cleanupAfterFrame();
+	}
+#if defined(__SWITCH__)
+	m_switchCompositeFrameStarted = false;
+#endif
 }
 
 bool OpenGLRenderer::BeginFrame(bool mainWindow)
@@ -509,6 +540,16 @@ void OpenGLRenderer::DrawEmptyFrame(bool mainWindow)
 
 void OpenGLRenderer::ClearColorbuffer(bool padView)
 {
+#if defined(__SWITCH__)
+	if (SwitchPlatform_IsGamePadCompositeActive())
+	{
+		if (m_switchCompositeFrameStarted)
+			return;
+		m_switchCompositeFrameStarted = true;
+		glDisable(GL_SCISSOR_TEST);
+		prevScissorEnable = false;
+	}
+#endif
 	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 }
@@ -594,6 +635,15 @@ void OpenGLRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 
 	// bind back buffer
 	rendertarget_bindFramebufferObject(nullptr);
+
+#if defined(__SWITCH__)
+	if (SwitchPlatform_IsGamePadCompositeActive())
+	{
+		if (!m_switchCompositeFrameStarted)
+			ClearColorbuffer(padView);
+		clearBackground = false;
+	}
+#endif
 
 	if (clearBackground)
 	{

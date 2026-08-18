@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(__SWITCH__)
+#include <EGL/egl.h>
+#endif
+
 #include "glext.h"
 
 #if BOOST_OS_WINDOWS > 0

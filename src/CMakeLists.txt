@@ -283,6 +283,9 @@ if (PLATFORM_SWITCH)
 	target_link_libraries(CemuBin PRIVATE SwitchVulkanDriver SwitchLsfgBackend imguiImpl
 		smb2 libusbhsfs
 		"-Wl,--whole-archive" CemuResource "-Wl,--no-whole-archive")
+	if(ENABLE_OPENGL)
+		target_link_libraries(CemuBin PRIVATE OpenGL::GL)
+	endif()
 	target_link_options(CemuBin PRIVATE "-flto=${SWITCH_LTO_JOBS}")
 	target_include_directories(CemuBin PRIVATE
 		"${CMAKE_SOURCE_DIR}/src"

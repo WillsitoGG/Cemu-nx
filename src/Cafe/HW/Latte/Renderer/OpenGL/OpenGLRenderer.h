@@ -184,6 +184,9 @@ private:
 	GLuint m_pipeline = 0;
 
 	bool m_isPadViewContext{};
+#if defined(__SWITCH__)
+	bool m_switchCompositeFrameStarted{};
+#endif
 
 	// rendertarget viewport
 	float prevViewportX = 0;

@@ -455,8 +455,9 @@ bool cemu_writeSettingsXml(const char *path, const std::vector<CemuKV> &s,
     }
     gpk->InsertEndChild(entry);
   }
+  const bool nativeVulkan = !strcmp(cemuKVGet(s, "Wrapper/Renderer", "vk"), "vk");
   XMLElement *g = upsertElement(doc, content, "Graphic");
-  ei(g, "api", 1);
+  ei(g, "api", nativeVulkan ? 1 : 0);
   ei(g, "VSync", gi("VSync", 0));
   es(g, "vkAccurateBarriers", gb("vkAccurateBarriers", true));
   ei(g, "UpscaleFilter", gi("UpscaleFilter", 1));
@@ -539,7 +540,8 @@ bool cemu_writeGameProfile(const char *dir, uint64_t titleId, const char *gameNa
     setIniValue(lines, "CPU", "cpuMode", cpu);
   if (*tq)
     setIniValue(lines, "CPU", "threadQuantum", tq);
-  setIniValue(lines, "Graphics", "graphics_api", "1");
+  const bool nativeVulkan = !strcmp(cemuKVGet(s, "Wrapper/Renderer", "vk"), "vk");
+  setIniValue(lines, "Graphics", "graphics_api", nativeVulkan ? "1" : "0");
 
   const std::string output = serializeIni(lines);
   const std::string tmp = target + ".tmp";

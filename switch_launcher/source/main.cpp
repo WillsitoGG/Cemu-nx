@@ -12,15 +12,19 @@
 #include <map>
 #include <unordered_map>
 #include <iterator>
+#include <initializer_list>
 #include <array>
 #include <climits>
 #include <string>
 #include <vector>
+#include <deque>
 #include <algorithm>
 #include <functional>
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <condition_variable>
+#include <memory>
 #include <unordered_set>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -35,8 +39,16 @@
 #include "install.h"
 #include "forwarder.h"
 #include "launcher_update.h"
+#include "localization.h"
 #include "SwitchStorage.h"
 #include "ui_audio.h"
+
+static void drawToastOverlay();
+static void pumpCoverDecodeResults();
+static void cancelQueuedCoverDecodes();
+static void stopCoverDecodeWorker();
+static void presentUi(SDL_Renderer *renderer) { drawToastOverlay(); SDL_RenderPresent(renderer); }
+#define SDL_RenderPresent presentUi
 
 // SDL uses Xbox button names.
 #define BTN_CONFIRM  SDL_CONTROLLER_BUTTON_B
@@ -56,23 +68,29 @@ static const char *LSFG_DIR = "sdmc:/switch/cemu/lsfg";
 static const char *LSFG_DLL_FILE = "sdmc:/switch/cemu/lsfg/Lossless.dll";
 static const char *LAUNCHER_NRO = "sdmc:/switch/cemu/cemu.nro";
 static std::string g_launcherNroPath = LAUNCHER_NRO;
-static const char *EMU_NRO_SRC = "romfs:/emu/cemu_vk.nro";
-static const char *EMU_HASH_SRC = "romfs:/emu/cemu_vk.sha256";
-static const char *EMU_NRO_DST = "sdmc:/switch/cemu/.emu/cemu_vk.nro";
+static const char *EMU_NRO_SRC = "romfs:/emu/cemu_core.nro";
+static const char *EMU_HASH_SRC = "romfs:/emu/cemu_core.sha256";
+static const char *EMU_NRO_DST = "sdmc:/switch/cemu/.emu/cemu_core.nro";
 static const char *LAUNCH_HANDOFF = "sdmc:/switch/cemu/switch.ini";
 
 struct KV { std::string k, v; };
-struct Store { std::vector<KV> kv; };
+struct Store {
+  std::vector<KV> kv;
+  mutable std::unordered_map<std::string,size_t> index;
+  mutable size_t indexedSize=SIZE_MAX;
+};
 
 static Store g_global;
 static Store g_game;
 static Store g_titles;
 static Store g_containerTitles;
+static Store g_gameIdentities;
 static Store *g_active = &g_global;
 static int g_systemCemuLanguage = 1;
 static const char *g_systemLanguageName = "English";
 static const char *TITLES_INI = "sdmc:/switch/cemu/titles.ini";
 static const char *CONTAINER_TITLES_INI = "sdmc:/switch/cemu/container_titles.ini";
+static const char *GAME_IDENTITIES_INI = "sdmc:/switch/cemu/game_identities.ini";
 
 static std::string trim(const std::string &s) {
   size_t a = s.find_first_not_of(" \t\r\n");
@@ -93,30 +111,48 @@ static void setLauncherPathFromArg(const char *path) {
   if(lowercase.size()<4||lowercase.compare(lowercase.size()-4,4,".nro")!=0) return;
   g_launcherNroPath=std::move(candidate);
 }
+static void ensureStoreIndex(const Store &s) {
+  if(s.indexedSize==s.kv.size())return;
+  s.index.clear();s.index.reserve(s.kv.size());
+  for(size_t item=0;item<s.kv.size();item++)s.index[s.kv[item].k]=item;
+  s.indexedSize=s.kv.size();
+}
+static void invalidateStoreIndex(Store &s) {
+  s.index.clear();s.indexedSize=SIZE_MAX;
+}
 static const char *storeGet(Store &s, const char *key, const char *def) {
-  for (auto &e : s.kv) if (e.k == key) return e.v.c_str();
-  return def;
+  ensureStoreIndex(s);
+  const auto found=s.index.find(key);
+  return found==s.index.end()?def:s.kv[found->second].v.c_str();
 }
 static void storeSet(Store &s, const char *key, const char *val) {
-  for (auto &e : s.kv) if (e.k == key) { e.v = val; return; }
-  s.kv.push_back({ key, val });
+  ensureStoreIndex(s);
+  const auto found=s.index.find(key);
+  if(found!=s.index.end()){s.kv[found->second].v=val;return;}
+  s.kv.push_back({key,val});s.index[s.kv.back().k]=s.kv.size()-1;s.indexedSize=s.kv.size();
 }
 static void storeRemove(Store &s, const char *key) {
-  for (size_t i = 0; i < s.kv.size(); i++) if (s.kv[i].k == key) { s.kv.erase(s.kv.begin()+i); return; }
+  ensureStoreIndex(s);const auto found=s.index.find(key);if(found==s.index.end())return;
+  s.kv.erase(s.kv.begin()+found->second);invalidateStoreIndex(s);
 }
 static void storeRemovePrefix(Store &s, const char *prefix) {
   const size_t length = strlen(prefix);
   s.kv.erase(std::remove_if(s.kv.begin(), s.kv.end(), [&](const KV &entry) {
     return entry.k.compare(0, length, prefix) == 0;
   }), s.kv.end());
+  invalidateStoreIndex(s);
 }
 static bool recoverAtomicFile(const std::string &path);
 static void storeLoad(Store &s, const char *path) {
   s.kv.clear();
+  invalidateStoreIndex(s);
   if (!recoverAtomicFile(path)) return;
   FILE *f = fopen(path, "r");
   if (!f) return;
-  char line[2048];
+  // Persistent library identities include canonical/current paths and a short
+  // rename history.  Keep a comfortably bounded line buffer so a valid Switch
+  // path is never truncated while loading that registry.
+  char line[32768];
   while (fgets(line, sizeof(line), f)) {
     std::string t = trim(line);
     if (t.empty() || t[0] == '#' || t[0] == ';' || t[0] == '[') continue;
@@ -233,6 +269,8 @@ static const Choice C_timer[]    = { {"1x (normal)","3"}, {"2x faster","2"}, {"4
                                      {"0.5x slower","4"}, {"0.25x slower","5"} };
 static const Choice C_bool[]     = { {"Off","false"}, {"On","true"} };
 static const Choice C_bool01[]   = { {"Off","0"}, {"On","1"} };
+static const Choice C_backend[]  = { {"Vulkan (NVK)","vk"}, {"OpenGL (NVC0)","gl"},
+                                     {"OpenGL (Zink/NVK)","zink"} };
 static const Choice C_barriers[] = { {"Disabled","false"}, {"Enabled","true"} };
 static const Choice C_filter[]   = { {"Bilinear","0"}, {"Bicubic","1"}, {"Hermite","2"}, {"Nearest","3"} };
 static const Choice C_scaling[]  = { {"Keep aspect ratio","0"}, {"Stretch","1"} };
@@ -263,6 +301,9 @@ static const Choice C_launcherTheme[] = { {"XMB (PS3)","xmb"}, {"Bubbles","homeb
                                           {"Classic","classic"}, {"OLED black","oled"} };
 static const Choice C_gridColumns[] = { {"3","3"}, {"4","4"}, {"5","5"}, {"6","6"}, {"7","7"}, {"8","8"} };
 static const Choice C_gridRows[] = { {"1","1"}, {"2","2"}, {"3","3"} };
+static const Choice C_uiLanguage[] = { {"System","system"}, {"English","en"}, {"Français","fr"},
+                                       {"Deutsch","de"}, {"Español","es"}, {"Italiano","it"},
+                                       {"Português","pt"} };
 
 enum { SCR_CPU, SCR_GRAPHICS, SCR_FRAMEGEN, SCR_AUDIO, SCR_OVERLAY, SCR_INPUT, SCR_ACCESSORIES, SCR_COUNT };
 
@@ -272,6 +313,7 @@ static const Opt S_cpu[] = {
   O_CHOICE("Hardware video decoding",  "H264HardwareDecode", C_bool,    "true"),
 };
 static const Opt S_graphics[] = {
+  O_CHOICE("Renderer",              "Wrapper/Renderer", C_backend, "vk"),
   O_CHOICE("VSync",                 "VSync",             C_bool01,  "0"),
   O_CHOICE("Triple buffering",      "TripleBuffer",      C_bool01,  "1"),
   O_CHOICE("Async shader compile",  "AsyncCompile",      C_bool,    "true"),
@@ -312,10 +354,13 @@ static const Opt S_accessories[] = {
   O_CHOICE("LEGO Dimensions Toypad", "UsbDimensions", C_bool, "false"),
 };
 static const Opt S_launcher[] = {
+  O_CHOICE("Language",          "Wrapper/Language",       C_uiLanguage,    "system"),
   O_CHOICE("Theme",             "Wrapper/Theme",          C_launcherTheme, "homebrew"),
   O_CHOICE("Games per row",     "Wrapper/GridColumns",    C_gridColumns,   "5"),
   O_CHOICE("Rows per page",     "Wrapper/GridRows",       C_gridRows,      "2"),
   O_CHOICE("Show game titles",  "Wrapper/ShowGameTitles", C_bool,          "true"),
+  O_CHOICE("Show region flags", "Wrapper/ShowRegionFlags", C_bool,         "true"),
+  O_CHOICE("Show custom settings badges", "Wrapper/ShowCustomSettingsBadges", C_bool, "true"),
   O_CHOICE("UI animations",     "Wrapper/UiAnimations",   C_bool,          "true"),
   O_CHOICE("Sound effects",     "Wrapper/UiSounds",       C_bool,          "true"),
   O_CHOICE("Check updates at boot", "Wrapper/CheckUpdatesAtBoot", C_bool,   "true"),
@@ -347,6 +392,9 @@ static const SettingHelpEntry SETTING_HELP[] = {
    "Changes the speed of the emulated CPU timer without increasing the Switch CPU clock. Some game-specific fixes need a different timer rate, but the normal 1x value is the safest default."},
   {"H264HardwareDecode", "Video playback",
    "Uses the Switch hardware video decoder for Wii U H.264 movies. Disable it only when troubleshooting broken or missing in-game video playback."},
+
+  {"Wrapper/Renderer", "Display backend",
+   "Chooses the graphics backend in the unified Cemu core. Vulkan (NVK) is recommended and is required by LSFG. OpenGL uses native NVC0, while Zink runs Cemu's OpenGL renderer on NVK as an additional compatibility path."},
 
   {"VSync", "Presentation",
    "Synchronizes completed frames to the display refresh to reduce tearing. It can add latency or expose performance drops when a game cannot maintain its target frame rate."},
@@ -407,6 +455,9 @@ static const SettingHelpEntry SETTING_HELP[] = {
   {"console_language", "Wii U system language",
    "Sets the language reported by the emulated Wii U console. Auto follows the Switch system language when Cemu supports it; games may need to be restarted after a change."},
 
+  {"Wrapper/Language", "Launcher language",
+   "Selects the language used by the SDL launcher. System follows the Switch console language; technical emulator names and identifiers remain unchanged for accuracy."},
+
   {"Wrapper/Theme", "Launcher appearance",
    "Changes the SDL launcher's background and visual theme. It does not affect gameplay rendering."},
   {"Wrapper/GridColumns", "Library layout",
@@ -415,6 +466,10 @@ static const SettingHelpEntry SETTING_HELP[] = {
    "Sets how many rows of game covers are displayed on each library page. More rows make each cover smaller."},
   {"Wrapper/ShowGameTitles", "Library layout",
    "Shows or hides game names below their cover artwork in the launcher library."},
+  {"Wrapper/ShowRegionFlags", "Library layout",
+   "Shows or hides the region flag in the top-left corner of each game cover."},
+  {"Wrapper/ShowCustomSettingsBadges", "Library layout",
+   "Shows or hides the square badge on games that have per-game settings. The settings themselves are not changed."},
   {"Wrapper/UiAnimations", "Launcher appearance",
    "Enables launcher transitions, moving highlights, and animated theme effects."},
   {"Wrapper/UiSounds", "Launcher audio",
@@ -439,8 +494,8 @@ static SettingHelpInfo settingHelpFor(const Opt &option) {
   if(option.type==OT_STATUS)
     return {"Required component",
             "Shows whether the Lossless Scaling frame-generation library is installed. LSFG cannot be enabled until Lossless.dll is copied to sdmc:/switch/cemu/lsfg/."};
-  return {"Setting",
-          "Changes this launcher or emulator option. Keep the default value when troubleshooting an unexpected game-specific problem."};
+  return {"Missing exact help",
+          "This launcher build is missing reviewed help for this setting."};
 }
 
 static void detectSystemLanguage() {
@@ -584,6 +639,8 @@ enum class LauncherTheme { Xmb, Bubbles, Glow, Classic, Oled };
 static LauncherTheme g_launcherTheme = LauncherTheme::Bubbles;
 static bool g_uiAnimations = true;
 static bool g_showGameTitles = true;
+static bool g_showRegionFlags = true;
+static bool g_showCustomSettingsBadges = true;
 static int g_gridColumns = 5;
 static int g_gridRows = 2;
 static SDL_Texture *g_glowTexture = nullptr;
@@ -723,6 +780,9 @@ static void applyLauncherAppearance() {
                     !strcmp(theme, "xmb") ? LauncherTheme::Xmb : LauncherTheme::Bubbles;
   g_uiAnimations = strcmp(storeGet(g_global, "Wrapper/UiAnimations", "true"), "false") != 0;
   g_showGameTitles = strcmp(storeGet(g_global, "Wrapper/ShowGameTitles", "true"), "false") != 0;
+  g_showRegionFlags = strcmp(storeGet(g_global, "Wrapper/ShowRegionFlags", "true"), "false") != 0;
+  g_showCustomSettingsBadges =
+      strcmp(storeGet(g_global, "Wrapper/ShowCustomSettingsBadges", "true"), "false") != 0;
   g_gridColumns = std::max(3, std::min(8, atoi(storeGet(g_global, "Wrapper/GridColumns", "5"))));
   g_gridRows = std::max(1, std::min(3, atoi(storeGet(g_global, "Wrapper/GridRows", "2"))));
 
@@ -1055,6 +1115,22 @@ static const std::string &ellipsizedText(TTF_Font *font, const std::string &text
 static void drawTextR(TTF_Font*f,int xr,int y,const char*s,SDL_Color c){ drawText(f,xr-textW(f,s),y,s,c); }
 static void drawTextC(TTF_Font*f,int cx,int y,const char*s,SDL_Color c){ drawText(f,cx-textW(f,s)/2,y,s,c); }
 
+// Translation is deliberately opt-in at semantic UI call sites.  Game names,
+// paths, network errors and text entered by the user continue to use drawText
+// directly, so a dynamic value can never be mistaken for a catalog key.
+template<size_t N>
+static void drawStaticText(TTF_Font*f,int x,int y,const char (&s)[N],SDL_Color c){
+  drawText(f,x,y,LauncherLocalization::Translate(s).data(),c);
+}
+template<size_t N>
+static void drawStaticTextR(TTF_Font*f,int xr,int y,const char (&s)[N],SDL_Color c){
+  drawTextR(f,xr,y,LauncherLocalization::Translate(s).data(),c);
+}
+template<size_t N>
+static void drawStaticTextC(TTF_Font*f,int cx,int y,const char (&s)[N],SDL_Color c){
+  drawTextC(f,cx,y,LauncherLocalization::Translate(s).data(),c);
+}
+
 static void drawTitleCell(int cx,int cellW,int y,const std::string&title,bool sel,SDL_Color col);
 static void downloadAllCovers();
 static void toast(const char *msg);
@@ -1076,6 +1152,52 @@ static void drawScrollTextL(TTF_Font *font,int x,int y,int maxWidth,const char *
 static void drawWrapped(TTF_Font *font,int x,int y,int maxWidth,int lineHeight,int maxLines,const char *text,SDL_Color color);
 static SDL_Texture *loadScaledTexture(const std::string &path,int width,int height);
 static bool g_rescanAfterSettings = false;
+
+struct StaticDialogText {
+  std::string value;
+  template<size_t N> StaticDialogText(const char (&literal)[N])
+      : value(LauncherLocalization::Translate(literal)) {}
+  StaticDialogText(const std::string &dynamic) : value(dynamic) {}
+  StaticDialogText(std::string &&dynamic) : value(std::move(dynamic)) {}
+};
+
+static std::vector<std::string> materializeStaticDialog(
+    std::initializer_list<StaticDialogText> lines) {
+  std::vector<std::string> result;
+  result.reserve(lines.size());
+  for(const StaticDialogText &line:lines) result.push_back(line.value);
+  return result;
+}
+
+template<size_t N>
+static void toastStatic(const char (&message)[N]) {
+  const std::string localized(LauncherLocalization::Translate(message));
+  toast(localized.c_str());
+}
+
+template<size_t N>
+static void modalMessageStatic(const char (&title)[N],
+                               std::initializer_list<StaticDialogText> lines) {
+  const std::string localizedTitle(LauncherLocalization::Translate(title));
+  modalMessage(localizedTitle.c_str(),materializeStaticDialog(lines));
+}
+
+template<size_t N>
+static bool confirmBoxStatic(const char (&title)[N],
+                             std::initializer_list<StaticDialogText> lines) {
+  const std::string localizedTitle(LauncherLocalization::Translate(title));
+  return confirmBox(localizedTitle.c_str(),materializeStaticDialog(lines));
+}
+
+template<size_t N>
+static void drawHeaderStatic(const char (&title)[N],const char *context) {
+  drawHeader(LauncherLocalization::Translate(title).data(),context);
+}
+
+template<size_t N>
+static int dropdownStaticTitle(const char (&title)[N],const char *const *labels,int count,int current) {
+  return dropdown(LauncherLocalization::Translate(title).data(),labels,count,current);
+}
 
 static SDL_Texture *g_flag[4] = { nullptr, nullptr, nullptr, nullptr };
 static void fillCircle(int cx,int cy,int r,SDL_Color c){
@@ -1106,7 +1228,8 @@ static SDL_Texture *makeFlagTex(int region,int W,int H){
 static void makeFlags(){ g_flag[1]=makeFlagTex(1,36,24); g_flag[2]=makeFlagTex(2,36,24); g_flag[3]=makeFlagTex(3,36,24); }
 
 static SDL_Texture *g_gA=nullptr,*g_gB=nullptr,*g_gX=nullptr,*g_gY=nullptr,
-                   *g_gPlus=nullptr,*g_gMinus=nullptr,*g_gL=nullptr,*g_gR=nullptr;
+                   *g_gPlus=nullptr,*g_gMinus=nullptr,*g_gL=nullptr,*g_gR=nullptr,
+                   *g_gLeftRight=nullptr,*g_gUpDown=nullptr;
 // Supersampling keeps the downscaled glyphs crisp.
 static const int GLYPH_SS = 3;
 static SDL_Texture *makeGlyph(const char *label, bool pill){
@@ -1145,9 +1268,11 @@ static void makeGlyphs(){
   g_gX=makeGlyph("X",false); g_gY=makeGlyph("Y",false);
   g_gPlus=makeGlyph("+",true); g_gMinus=makeGlyph("-",true);
   g_gL=makeGlyph("L",true); g_gR=makeGlyph("R",true);
+  g_gLeftRight=makeGlyph("< >",true);
+  g_gUpDown=makeGlyph("^ v",true);
 }
 
-enum FootAct { FA_NONE, FA_LAUNCH, FA_SORT, FA_OPTIONS, FA_SETTINGS, FA_PAGEL, FA_PAGER, FA_QUIT };
+enum FootAct { FA_NONE, FA_LAUNCH, FA_SORT, FA_OPTIONS, FA_SETTINGS, FA_FILTER, FA_PAGEL, FA_PAGER, FA_QUIT };
 struct FootItem { SDL_Texture *glyph; const char *label; int act; };
 static SDL_Rect g_footHit[10]; static int g_footAct[10]; static int g_footN=0;
 static void drawFooterHints(const FootItem *it,int n,int cy){
@@ -1183,6 +1308,8 @@ static SDL_Texture *glyphForButton(const char *button){
   if(strcmp(button,"-")==0) return g_gMinus;
   if(strcmp(button,"L")==0) return g_gL;
   if(strcmp(button,"R")==0) return g_gR;
+  if(strcmp(button,"Left / Right")==0) return g_gLeftRight;
+  if(strcmp(button,"Up / Down")==0) return g_gUpDown;
   return nullptr;
 }
 
@@ -1220,6 +1347,11 @@ static int drawButtonHint(int x,int cy,const char *button,const char *label){
   return width+((label&&label[0])?8+textW(g_font_sm,label):0);
 }
 
+template<size_t N>
+static int drawStaticButtonHint(int x,int cy,const char *button,const char (&label)[N]) {
+  return drawButtonHint(x,cy,button,LauncherLocalization::Translate(label).data());
+}
+
 static void drawSettingsFooter(const char *text,int centerY=-1){
   if(!text||!text[0]) return;
   std::vector<std::string> tokens;
@@ -1253,6 +1385,28 @@ static void drawSettingsFooter(const char *text,int centerY=-1){
     x+=drawButtonHint(x,cy,tokens[i].c_str(),tokens[i+1].c_str());
     if(i+2<tokens.size()) x+=pairGap;
   }
+}
+
+// Semantic helper for static UI hints. Dynamic paths, game names and error
+// text never pass through localization or the low-level drawing routines.
+static void drawLocalizedFooter(const char *text,int centerY=-1){
+  if(!text||!text[0]) return;
+  std::vector<std::string> tokens;
+  const size_t length=strlen(text); size_t cursor=0;
+  while(cursor<length){
+    while(cursor<length&&text[cursor]==' ') cursor++;
+    if(cursor>=length) break;
+    const size_t start=cursor;
+    while(cursor<length&&!(cursor+1<length&&text[cursor]==' '&&text[cursor+1]==' ')) cursor++;
+    tokens.emplace_back(trim(std::string(text+start,cursor-start)));
+    while(cursor<length&&text[cursor]==' ') cursor++;
+  }
+  std::string localized;
+  for(size_t index=0;index<tokens.size();index++){
+    if(index) localized+="       ";
+    localized+=index%2?std::string(LauncherLocalization::Translate(tokens[index])):tokens[index];
+  }
+  drawSettingsFooter(localized.c_str(),centerY);
 }
 
 enum TouchKind { TOUCH_NONE, TOUCH_TAP, TOUCH_SWIPE_L, TOUCH_SWIPE_R, TOUCH_SCROLL_UP, TOUCH_SCROLL_DOWN };
@@ -1341,6 +1495,9 @@ static SDL_GameController *g_pad=nullptr;
 static bool g_exitRequested=false;
 static int g_navHeld=0;
 static Uint32 g_navSince=0,g_navLast=0;
+static Uint32 g_fxT=0,g_redrawUntil=0;
+static std::string g_toastMessage;
+static Uint32 g_toastUntil=0;
 
 static void openController(int index) {
   if (!g_pad && index >= 0 && SDL_IsGameController(index))
@@ -1363,6 +1520,7 @@ static bool beginUiFrame() {
     return false;
   }
   if(g_pad&&!SDL_GameControllerGetAttached(g_pad)) closeController();
+  pumpCoverDecodeResults();
   return true;
 }
 
@@ -1385,6 +1543,10 @@ static int keyboardNavigationButton(SDL_Keycode key) {
 
 static bool pollUiEvent(SDL_Event &event) {
   while (SDL_PollEvent(&event)) {
+    if(event.type==SDL_CONTROLLERBUTTONDOWN||event.type==SDL_CONTROLLERAXISMOTION||
+       event.type==SDL_FINGERDOWN||event.type==SDL_FINGERMOTION||event.type==SDL_FINGERUP||
+       event.type==SDL_KEYDOWN)
+      g_redrawUntil=SDL_GetTicks()+220;
     if (event.type == SDL_QUIT) {
       g_exitRequested = true;
       continue;
@@ -1429,6 +1591,27 @@ static bool pollUiEvent(SDL_Event &event) {
   return false;
 }
 
+// Wait until input, a worker notification, or the next animated frame.  Static
+// screens no longer spin continuously, while animated themes keep a steady
+// presentation cadence without the old fixed eight-millisecond busy loop.
+static void waitForNextUiFrame() {
+  for(;;){
+    SDL_Event event{};
+    const Uint32 now=SDL_GetTicks();
+    const bool transientAnimation=g_uiAnimations&&!SDL_TICKS_PASSED(now,g_redrawUntil);
+    int frameDeadline=(hasAnimatedBackground()||transientAnimation||g_navHeld)?16:-1;
+    if(!g_toastMessage.empty()){
+      if(SDL_TICKS_PASSED(now,g_toastUntil)){ g_toastMessage.clear(); return; }
+      const int remaining=(int)(g_toastUntil-now);
+      frameDeadline=frameDeadline<0?remaining:std::min(frameDeadline,remaining);
+    }
+    const int timeout=frameDeadline<0?250:std::min(frameDeadline,250);
+    if(SDL_WaitEventTimeout(&event,timeout)){ SDL_PushEvent(&event); return; }
+    if(!appletMainLoop()){ g_exitRequested=true; return; }
+    if(frameDeadline>=0) return;
+  }
+}
+
 static void navRepeat(){
   if(!g_pad) return;
   const int TH=18000;
@@ -1449,30 +1632,101 @@ static void navRepeat(){
 
 struct Game {
   std::string path;
+  std::string storageId;
   std::string file;
   std::string title;
   std::string key;
+  std::string legacyKey;
+  uint64_t fingerprint = 0;
+  long long fileSize = 0;
+  long long modified = 0;
   uint64_t titleId = 0;
   std::string titleIdError;
   std::string iconPath;
   SDL_Texture *cover = nullptr;
   Uint32 coverAt = 0;
   Uint64 coverUse = 0;
+  Uint64 coverRequest = 0;
+  bool coverQueued = false;
   bool triedCover = false;
   bool hasCfg = false;
   int region = 0;
   long long added = 0;
   long long played = 0;
 };
+static std::string foldedKey(std::string key);
 static std::vector<Game> g_games;
+struct Collection { std::string name; std::unordered_set<std::string> games; };
+static std::vector<Game*> g_libraryView;
+static std::unordered_set<std::string> g_favorites;
+static std::vector<Collection> g_collections;
+static std::string g_activeCollection;
+static std::string g_searchQuery;
 static Uint64 g_coverUseSerial = 0;
-static constexpr size_t COVER_CACHE_LIMIT = 28;
+static constexpr size_t COVER_CACHE_LIMIT = 64;
 
 enum { SORT_ALPHA, SORT_RECENT, SORT_ADDED, SORT_COUNT };
 static const char *SORT_NAME[SORT_COUNT] = { "A-Z", "Recently played", "Recently added" };
 static int g_sort = SORT_ALPHA;
 static Store g_recent;
 static const char *RECENT_INI = "sdmc:/switch/cemu/recent.ini";
+
+static void rebuildLibraryView() {
+  g_libraryView.clear();
+  const Collection *collection=nullptr;
+  if(!g_activeCollection.empty()&&g_activeCollection!="favorites")
+    for(const Collection &candidate:g_collections) if(candidate.name==g_activeCollection){ collection=&candidate; break; }
+  std::string query=foldedKey(g_searchQuery);
+  for(Game &game:g_games){
+    if(g_activeCollection=="favorites"&&!g_favorites.count(game.key)) continue;
+    if(collection&&!collection->games.count(game.key)) continue;
+    if(!query.empty()){
+      const std::string searchable=foldedKey(game.title+" "+game.file+" "+game.path+" "+game.key);
+      if(searchable.find(query)==std::string::npos) continue;
+    }
+    g_libraryView.push_back(&game);
+  }
+}
+
+static void loadLibraryOrganization() {
+  g_favorites.clear(); g_collections.clear();
+  const int favorites=std::max(0,std::min(16384,atoi(storeGet(g_global,"Library/FavoriteCount","0"))));
+  for(int i=0;i<favorites;i++){
+    const std::string key="Library/Favorite"+std::to_string(i);
+    const char *id=storeGet(g_global,key.c_str(),""); if(id[0]) g_favorites.insert(id);
+  }
+  const int count=std::max(0,std::min(128,atoi(storeGet(g_global,"Library/CollectionCount","0"))));
+  for(int i=0;i<count;i++){
+    const std::string prefix="Library/Collection"+std::to_string(i);
+    Collection collection; collection.name=storeGet(g_global,(prefix+"Name").c_str(),"");
+    const int members=std::max(0,std::min(16384,atoi(storeGet(g_global,(prefix+"Count").c_str(),"0"))));
+    for(int m=0;m<members;m++){
+      const char *id=storeGet(g_global,(prefix+"Game"+std::to_string(m)).c_str(),"");
+      if(id[0]) collection.games.insert(id);
+    }
+    if(!collection.name.empty()) g_collections.emplace_back(std::move(collection));
+  }
+  // Collection and search are deliberately transient: every boot starts at All games.
+  g_activeCollection.clear(); g_searchQuery.clear();
+  storeRemove(g_global,"Library/ActiveCollection"); storeRemove(g_global,"Library/Search");
+}
+
+static void saveLibraryOrganization() {
+  storeRemovePrefix(g_global,"Library/Favorite");
+  storeSet(g_global,"Library/FavoriteCount",std::to_string(g_favorites.size()).c_str());
+  size_t index=0; for(const std::string &id:g_favorites)
+    storeSet(g_global,("Library/Favorite"+std::to_string(index++)).c_str(),id.c_str());
+  storeRemovePrefix(g_global,"Library/Collection");
+  storeSet(g_global,"Library/CollectionCount",std::to_string(g_collections.size()).c_str());
+  for(size_t i=0;i<g_collections.size();i++){
+    const std::string prefix="Library/Collection"+std::to_string(i);
+    storeSet(g_global,(prefix+"Name").c_str(),g_collections[i].name.c_str());
+    storeSet(g_global,(prefix+"Count").c_str(),std::to_string(g_collections[i].games.size()).c_str());
+    size_t member=0; for(const std::string &id:g_collections[i].games)
+      storeSet(g_global,(prefix+"Game"+std::to_string(member++)).c_str(),id.c_str());
+  }
+  storeSave(g_global,LAUNCHER_INI);
+}
 
 static int detectRegion(const std::string &file) {
   std::string tags; int depth = 0;
@@ -1498,6 +1752,7 @@ static void applySort() {
     if (g_sort == SORT_ADDED  && a.added  != b.added)  return a.added  > b.added;
     return cmpTitle(a, b);
   });
+  rebuildLibraryView();
 }
 static void recordPlayed(const Game &game){
   long long seq = atoll(storeGet(g_global,"Wrapper/PlaySeq","0")) + 1;
@@ -1515,6 +1770,7 @@ static bool hasGameExt(const char *n) {
 }
 static std::string join(const std::string &b, const std::string &n) { std::string r=b; if(!r.empty()&&r.back()=='/') r.pop_back(); return r+"/"+n; }
 static std::string foldedKey(std::string key);
+static bool pathAtOrBelow(const std::string &path,const std::string &root);
 
 static std::string normalizeLocationPath(const std::string &input) {
   std::string path=trim(input);
@@ -1541,12 +1797,34 @@ static std::string pathIdentity(const std::string &input) {
   return foldedKey(normalizeLocationPath(input));
 }
 
+static std::string usbStableIdForPath(const std::string &path) {
+  const std::string candidate=pathIdentity(path);
+  for(const auto &location:SwitchStorage::ListUsbLocations()){
+    const std::string root=pathIdentity(location.path);
+    if(candidate==root||
+       (candidate.size()>root.size()&&candidate.compare(0,root.size(),root)==0&&
+        candidate[root.size()]=='/')) return location.id;
+  }
+  return {};
+}
+
 static std::vector<std::string> loadGameSources() {
   std::vector<std::string> paths;
   int count=std::max(0,std::min(16,atoi(storeGet(g_global,"Wrapper/GamePathCount","1"))));
   for(int i=0;i<count;i++){
     std::string key="Wrapper/GamePath"+std::to_string(i);
     std::string path=normalizeLocationPath(storeGet(g_global,key.c_str(),i==0?DEF_GAMEDIR:""));
+    const std::string stableKey="Wrapper/GamePathStable"+std::to_string(i);
+    const std::string relativeKey="Wrapper/GamePathRelative"+std::to_string(i);
+    const std::string stableId=storeGet(g_global,stableKey.c_str(),"");
+    if(!stableId.empty()){
+      const std::string root=SwitchStorage::ResolveUsbPath(stableId);
+      // A stored ums alias is never authoritative once a stable binding
+      // exists. If that disk is offline, omit the source rather than scanning
+      // an unrelated disk that reused the old alias.
+      if(root.empty()) continue;
+      path=normalizeLocationPath(root+storeGet(g_global,relativeKey.c_str(),""));
+    }
     if(!path.empty()) paths.push_back(std::move(path));
   }
   std::unordered_set<std::string> seen;
@@ -1563,11 +1841,30 @@ static void saveGameSources(const std::vector<std::string> &input) {
     std::string path=normalizeLocationPath(entry);
     if(!path.empty() && seen.insert(pathIdentity(path)).second && paths.size()<16) paths.push_back(std::move(path));
   }
+  struct SourceBinding { std::string stableId,relative; };
+  std::vector<SourceBinding> bindings(paths.size());
+  const auto usbLocations=SwitchStorage::ListUsbLocations();
+  for(size_t i=0;i<paths.size();i++){
+    for(const auto &location:usbLocations){
+      const std::string root=normalizeLocationPath(location.path);
+      if(pathAtOrBelow(paths[i],root)){
+        bindings[i].stableId=location.id;
+        bindings[i].relative=paths[i].substr(root.size());
+        break;
+      }
+    }
+  }
   storeRemovePrefix(g_global,"Wrapper/GamePath");
   storeSet(g_global,"Wrapper/GamePathCount",std::to_string(paths.size()).c_str());
   for(size_t i=0;i<paths.size();i++){
     std::string key="Wrapper/GamePath"+std::to_string(i);
     storeSet(g_global,key.c_str(),paths[i].c_str());
+    if(!bindings[i].stableId.empty()){
+      const std::string stableKey="Wrapper/GamePathStable"+std::to_string(i);
+      const std::string relativeKey="Wrapper/GamePathRelative"+std::to_string(i);
+      storeSet(g_global,stableKey.c_str(),bindings[i].stableId.c_str());
+      storeSet(g_global,relativeKey.c_str(),bindings[i].relative.c_str());
+    }
   }
 }
 
@@ -1716,6 +2013,288 @@ static std::string makeGameKey(const std::string &file, const std::string &path)
   return base + suffix;
 }
 
+static uint64_t fingerprintGameFile(const std::string &path, const struct stat &st) {
+  uint64_t hash=1469598103934665603ULL;
+  auto feed=[&](const void *data,size_t size){
+    const unsigned char *bytes=static_cast<const unsigned char*>(data);
+    for(size_t i=0;i<size;i++){ hash^=bytes[i]; hash*=1099511628211ULL; }
+  };
+  const uint64_t size=static_cast<uint64_t>(st.st_size);
+  feed(&size,sizeof(size));
+  FILE *file=fopen(path.c_str(),"rb");
+  if(!file) return hash;
+  std::array<unsigned char,65536> buffer{};
+  size_t read=fread(buffer.data(),1,buffer.size(),file);
+  feed(buffer.data(),read);
+  if(st.st_size>static_cast<off_t>(buffer.size()) &&
+     fseeko(file,st.st_size-static_cast<off_t>(buffer.size()),SEEK_SET)==0){
+    read=fread(buffer.data(),1,buffer.size(),file);
+    feed(buffer.data(),read);
+  }
+  fclose(file);
+  return hash;
+}
+
+static uint64_t fingerprintGameDirectory(const std::string &path,uint64_t titleId) {
+  uint64_t hash=1469598103934665603ULL;
+  auto feed=[&](const void *data,size_t size){
+    const auto *bytes=static_cast<const unsigned char*>(data);
+    for(size_t index=0;index<size;index++){hash^=bytes[index];hash*=1099511628211ULL;}
+  };
+  // Title metadata identifies an unpacked game independently of its folder
+  // name. Sample the RPX header as a fallback for malformed/no-ID homebrew.
+  feed(&titleId,sizeof(titleId));
+  const std::string codePath=join(path,"code");
+  DIR *directory=opendir(codePath.c_str());
+  if(directory){
+    std::vector<std::string> candidates;dirent *entry=nullptr;
+    while((entry=readdir(directory))){
+      const std::string name=entry->d_name;
+      const size_t dot=name.find_last_of('.');
+      if(dot!=std::string::npos&&foldedKey(name.substr(dot))==".rpx")candidates.push_back(name);
+    }
+    closedir(directory);std::sort(candidates.begin(),candidates.end());
+    if(!candidates.empty()){
+      const std::string file=join(codePath,candidates.front());struct stat info{};
+      if(stat(file.c_str(),&info)==0&&S_ISREG(info.st_mode)){
+        const uint64_t size=(uint64_t)info.st_size;feed(&size,sizeof(size));
+        FILE *input=fopen(file.c_str(),"rb");if(input){std::array<unsigned char,65536> bytes{};const size_t count=fread(bytes.data(),1,bytes.size(),input);feed(bytes.data(),count);fclose(input);}
+      }
+    }
+  }
+  return hash;
+}
+
+static std::string stableGameKey(uint64_t titleId,const std::string &path,const struct stat &st,
+                                 bool isDirectory,uint64_t knownFingerprint=0) {
+  char key[64]{};
+  if(titleId&&isDirectory){
+    snprintf(key,sizeof(key),"wiiu-dir-%016llx",(unsigned long long)titleId);
+    return key;
+  }
+  uint64_t fingerprint=knownFingerprint;
+  if(!fingerprint&&!isDirectory) fingerprint=fingerprintGameFile(path,st);
+  else if(isDirectory) fingerprint=fingerprintGameDirectory(path,titleId);
+  if(titleId) snprintf(key,sizeof(key),"wiiu-%016llx-%016llx",(unsigned long long)titleId,
+                       (unsigned long long)fingerprint);
+  else snprintf(key,sizeof(key),"content-%016llx",(unsigned long long)fingerprint);
+  return key;
+}
+
+struct GameIdentityRecord {
+  std::string key,format,canonicalPath,currentPath;
+  std::vector<std::string> previousPaths;
+  uint64_t titleId=0,fingerprint=0;
+  bool retired=false;
+};
+
+static constexpr size_t MAX_PREVIOUS_LIBRARY_PATHS=6;
+
+static std::string identityFormat(const std::string &path,bool directory) {
+  if(directory) return "dir";
+  const size_t dot=path.find_last_of('.');
+  return foldedKey(dot==std::string::npos?std::string{}:path.substr(dot+1));
+}
+
+static std::string identityScope(const std::string &canonical) {
+  if(canonical.rfind("usb:",0)==0||canonical.rfind("smb:",0)==0){
+    const size_t slash=canonical.find('/',4);
+    return slash==std::string::npos?canonical:canonical.substr(0,slash);
+  }
+  const size_t colon=canonical.find(':');
+  return colon==std::string::npos?std::string{}:canonical.substr(0,colon+1);
+}
+
+static std::string canonicalGamePath(const std::string &input) {
+  const std::string path=normalizeLocationPath(input);
+  for(const auto &location:SwitchStorage::ListUsbLocations()){
+    const std::string root=normalizeLocationPath(location.path);
+    if(!pathAtOrBelow(path,root)) continue;
+    std::string relative=path.substr(std::min(path.size(),root.size()));
+    while(!relative.empty()&&relative.front()=='/') relative.erase(relative.begin());
+    return "usb:"+foldedKey(location.id)+"/"+foldedKey(relative);
+  }
+  // SMB devoptab names are deterministically derived from the configured
+  // share ID, so the normalized path is already independent of server aliases.
+  return pathIdentity(path);
+}
+
+static bool identityPathExists(const GameIdentityRecord &record) {
+  if(record.retired||record.currentPath.empty())return false;
+  struct stat info{};
+  if(stat(record.currentPath.c_str(),&info)!=0||(!S_ISREG(info.st_mode)&&!S_ISDIR(info.st_mode)))return false;
+  // A recycled umsN: alias must never make an old record look live for a
+  // different disk.  Re-resolve the stable USB identity before reserving it.
+  return canonicalGamePath(record.currentPath)==record.canonicalPath;
+}
+
+static size_t canonicalRenameScore(const std::string &left,const std::string &right) {
+  const size_t leftSlash=left.find_last_of('/'),rightSlash=right.find_last_of('/');
+  if(leftSlash!=std::string::npos&&rightSlash!=std::string::npos&&
+     left.substr(0,leftSlash)==right.substr(0,rightSlash))
+    return (size_t{1}<<30)+leftSlash;
+  size_t common=0,lastBoundary=0;
+  while(common<left.size()&&common<right.size()&&left[common]==right[common]){
+    if(left[common]=='/')lastBoundary=common+1;
+    ++common;
+  }
+  return lastBoundary;
+}
+
+static void rememberPreviousPath(GameIdentityRecord &record,const std::string &path) {
+  const std::string normalized=normalizeLocationPath(path);
+  if(normalized.empty()) return;
+  record.previousPaths.erase(std::remove_if(record.previousPaths.begin(),record.previousPaths.end(),
+    [&](const std::string &entry){return pathIdentity(entry)==pathIdentity(normalized);}),record.previousPaths.end());
+  record.previousPaths.push_back(normalized);
+  if(record.previousPaths.size()>MAX_PREVIOUS_LIBRARY_PATHS)
+    record.previousPaths.erase(record.previousPaths.begin(),
+                               record.previousPaths.end()-MAX_PREVIOUS_LIBRARY_PATHS);
+}
+
+static std::string encodeIdentityField(const std::string &value) {
+  static const char hex[]="0123456789ABCDEF";
+  std::string encoded;encoded.reserve(value.size()*2);
+  for(unsigned char byte:value){encoded.push_back(hex[byte>>4]);encoded.push_back(hex[byte&15]);}
+  return encoded;
+}
+
+static bool decodeIdentityField(const std::string &value,std::string &decoded) {
+  if(value.size()%2) return false;
+  auto digit=[](unsigned char c)->int{
+    if(c>='0'&&c<='9')return c-'0';
+    c=(unsigned char)std::tolower(c);return c>='a'&&c<='f'?c-'a'+10:-1;
+  };
+  decoded.clear();decoded.reserve(value.size()/2);
+  for(size_t index=0;index<value.size();index+=2){
+    const int high=digit(value[index]),low=digit(value[index+1]);
+    if(high<0||low<0){decoded.clear();return false;}
+    decoded.push_back((char)((high<<4)|low));
+  }
+  return true;
+}
+
+static bool parseIdentityRecord(const KV &entry,GameIdentityRecord &record) {
+  record={};record.key=entry.k;
+  if(entry.v.rfind("v2,",0)==0){
+    std::vector<std::string> fields;size_t start=3;
+    for(;;){const size_t comma=entry.v.find(',',start);fields.push_back(entry.v.substr(start,comma==std::string::npos?std::string::npos:comma-start));if(comma==std::string::npos)break;start=comma+1;}
+    if(fields.size()<7)return false;
+    char *end=nullptr;errno=0;record.titleId=strtoull(fields[0].c_str(),&end,16);if(errno||!end||*end)return false;
+    record.format=fields[1];errno=0;record.fingerprint=strtoull(fields[2].c_str(),&end,16);if(errno||!end||*end)return false;
+    if(!decodeIdentityField(fields[3],record.canonicalPath)||!decodeIdentityField(fields[4],record.currentPath))return false;
+    record.retired=fields[5]=="1";errno=0;const unsigned long count=strtoul(fields[6].c_str(),&end,10);if(errno||!end||*end||count>MAX_PREVIOUS_LIBRARY_PATHS||fields.size()!=7+count)return false;
+    for(size_t index=0;index<count;index++){std::string path;if(!decodeIdentityField(fields[7+index],path))return false;record.previousPaths.push_back(std::move(path));}
+    return !record.key.empty()&&!record.format.empty()&&!record.canonicalPath.empty();
+  }
+  // Read the 1.0.x hash-only format so existing per-game data keeps its ID.
+  // It is upgraded to v2 as soon as a compatible title is observed.
+  char format[20]{};unsigned long long title=0,fingerprint=0,scope=0,locator=0;int used=0;
+  if(sscanf(entry.v.c_str(),"%llx,%19[^,],%llx,%llx,%llx%n",&title,format,&fingerprint,&scope,&locator,&used)!=5||entry.v[used])return false;
+  record.format=format;record.titleId=(uint64_t)title;record.fingerprint=(uint64_t)fingerprint;
+  return !record.key.empty();
+}
+
+static void saveIdentityRecord(Store &store,const GameIdentityRecord &record) {
+  char header[128];snprintf(header,sizeof(header),"v2,%016llx,%s,%016llx,",
+    (unsigned long long)record.titleId,record.format.c_str(),(unsigned long long)record.fingerprint);
+  std::string value=header+encodeIdentityField(record.canonicalPath)+","+
+    encodeIdentityField(record.currentPath)+","+(record.retired?"1":"0")+","+
+    std::to_string(record.previousPaths.size());
+  for(const std::string &path:record.previousPaths)value+=","+encodeIdentityField(path);
+  storeSet(store,record.key.c_str(),value.c_str());
+}
+
+static std::string choosePersistentGameKey(const Store &registry,Store &refreshed,
+                                           std::unordered_set<std::string> &used,
+                                           std::unordered_set<std::string> &reservedIds,
+                                           const std::unordered_set<std::string> &reservedCanonicalPaths,
+                                           uint64_t titleId,uint64_t fingerprint,
+                                           const std::string &format,const std::string &canonical,
+                                           const std::string &currentPath) {
+  std::vector<GameIdentityRecord> records;
+  for(const KV &entry:registry.kv){ GameIdentityRecord record; if(parseIdentityRecord(entry,record)) records.push_back(std::move(record)); }
+  auto compatible=[&](const GameIdentityRecord &record){
+    return record.format==format&&record.titleId==titleId;
+  };
+  GameIdentityRecord *chosen=nullptr;
+  for(auto &record:records)if(!record.retired&&!used.count(record.key)&&
+    record.canonicalPath==canonical&&compatible(record)){chosen=&record;break;}
+  for(auto &record:records)if(!record.retired&&record.canonicalPath==canonical&&!compatible(record)){
+    rememberPreviousPath(record,record.currentPath);record.currentPath.clear();record.retired=true;saveIdentityRecord(refreshed,record);
+    reservedIds.erase(record.key);
+  }
+  const std::string scope=identityScope(canonical);
+  if(!chosen){
+    GameIdentityRecord *best=nullptr;size_t bestScore=0;bool tied=false;
+    for(auto &record:records){
+      if(record.retired||used.count(record.key)||!compatible(record)||record.fingerprint!=fingerprint||
+         scope.empty()||identityScope(record.canonicalPath)!=scope)continue;
+      if(reservedIds.count(record.key)&&!record.canonicalPath.empty()&&
+         reservedCanonicalPaths.count(record.canonicalPath))continue;
+      const size_t score=canonicalRenameScore(record.canonicalPath,canonical);
+      if(!best||score>bestScore){best=&record;bestScore=score;tied=false;}
+      else if(score==bestScore)tied=true;
+    }
+    // If two vanished identical copies are indistinguishable, keep both old
+    // records reserved rather than silently attaching the wrong settings.
+    if(best&&!tied){chosen=best;reservedIds.erase(best->key);}
+  }
+  // Legacy hash-only records have no locator. Match only an unambiguous
+  // compatible record, preserving its historical key without guessing between
+  // identical copies.
+  if(!chosen){
+    std::vector<GameIdentityRecord*> legacy;
+    for(auto &record:records)if(!record.retired&&!used.count(record.key)&&record.canonicalPath.empty()&&
+      compatible(record)&&(record.fingerprint==fingerprint||(format=="dir"&&titleId!=0)))legacy.push_back(&record);
+    if(legacy.size()==1)chosen=legacy.front();
+  }
+  GameIdentityRecord current;
+  if(chosen) current=*chosen;
+  else {
+    struct stat dummy{}; dummy.st_size=0;
+    current.key=stableGameKey(titleId,"",dummy,false,fingerprint);
+    const std::string base=current.key;
+    auto registryHas=[&](const std::string &key){
+      return std::any_of(registry.kv.begin(),registry.kv.end(),[&](const KV &entry){return entry.k==key;});
+    };
+    for(unsigned suffix=2;used.count(current.key)||registryHas(current.key);suffix++)
+      current.key=base+"-"+std::to_string(suffix);
+  }
+  const std::string normalized=normalizeLocationPath(currentPath);
+  if(!current.currentPath.empty()&&pathIdentity(current.currentPath)!=pathIdentity(normalized))
+    rememberPreviousPath(current,current.currentPath);
+  current.titleId=titleId;current.fingerprint=fingerprint;current.format=format;
+  current.canonicalPath=canonical;current.currentPath=normalized;current.retired=false;
+  used.insert(current.key); saveIdentityRecord(refreshed,current);
+  reservedIds.erase(current.key);
+  return current.key;
+}
+
+static void migrateIdentityFile(const std::string &directory,const std::string &oldKey,
+                                const std::string &newKey,const char *extension) {
+  if(oldKey.empty()||oldKey==newKey) return;
+  const std::string oldPath=directory+"/"+oldKey+extension;
+  const std::string newPath=directory+"/"+newKey+extension;
+  struct stat oldStat{},newStat{};
+  if(stat(oldPath.c_str(),&oldStat)!=0||stat(newPath.c_str(),&newStat)==0) return;
+  (void)rename(oldPath.c_str(),newPath.c_str());
+}
+
+static void migrateGameIdentity(Game &game) {
+  if(game.legacyKey.empty()||game.legacyKey==game.key) return;
+  if(!storeGet(g_titles,game.key.c_str(),"")[0]){
+    const char *legacy=storeGet(g_titles,game.legacyKey.c_str(),"");
+    if(legacy[0]) storeSet(g_titles,game.key.c_str(),legacy);
+  }
+  if(!storeGet(g_recent,game.key.c_str(),"")[0]){
+    const char *legacy=storeGet(g_recent,game.legacyKey.c_str(),"");
+    if(legacy[0]) storeSet(g_recent,game.key.c_str(),legacy);
+  }
+  migrateIdentityFile(COVERS_DIR,game.legacyKey,game.key,".png");
+  migrateIdentityFile(GAMECFG_DIR,game.legacyKey,game.key,".ini");
+}
+
 static const char *gameStoreGet(Store &store, const Game &game, const char *def) {
   return storeGet(store, game.key.c_str(), def);
 }
@@ -1724,7 +2303,7 @@ static bool gameFileExists(const char *dir, const Game &game, const char *extens
   return regularFileExists(std::string(dir) + "/" + game.key + extension);
 }
 
-static void scanGames(const std::vector<std::string> &sourcePaths) {
+[[maybe_unused]] static void scanGames(const std::vector<std::string> &sourcePaths) {
   for (auto &g : g_games) if (g.cover) SDL_DestroyTexture(g.cover);
   g_games.clear();
   g_coverUseSerial = 0;
@@ -1746,20 +2325,27 @@ static void scanGames(const std::vector<std::string> &sourcePaths) {
       Game g;
       g.file=e->d_name;
       g.path=full;
-      g.key=makeGameKey(e->d_name,full);
+      g.legacyKey=makeGameKey(e->d_name,full);
+      g.key=g.legacyKey;
       bool haveStat=stat(full.c_str(),&sst)==0;
-      if(haveStat) g.added=(long long)sst.st_mtime;
+      if(haveStat){ g.added=(long long)sst.st_mtime; g.modified=g.added; g.fileSize=(long long)sst.st_size; }
       if(!isDir&&haveStat){
-        const char *cached=storeGet(g_containerTitles,g.key.c_str(),"");
-        long long cachedSize=0,cachedTime=0; unsigned long long cachedId=0; int consumed=0;
-        if(sscanf(cached,"%lld,%lld,%llx%n",&cachedSize,&cachedTime,&cachedId,&consumed)==3&&cached[consumed]==0&&
-           cachedSize==(long long)sst.st_size&&cachedTime==(long long)sst.st_mtime&&(cachedId>>48)==0x0005)
+        const char *cached=storeGet(g_containerTitles,g.legacyKey.c_str(),"");
+        long long cachedSize=0,cachedTime=0; unsigned long long cachedId=0,cachedFingerprint=0; int consumed=0;
+        const int parsed=sscanf(cached,"%lld,%lld,%llx,%llx%n",&cachedSize,&cachedTime,&cachedId,&cachedFingerprint,&consumed);
+        if(parsed>=3&&cached[consumed]==0&&cachedSize==(long long)sst.st_size&&cachedTime==(long long)sst.st_mtime&&(cachedId>>48)==0x0005){
           g.titleId=(uint64_t)cachedId;
+          if(parsed==4) g.fingerprint=(uint64_t)cachedFingerprint;
+        }
       }
       if(!g.titleId) g.titleId=cemu_resolveBaseTitleId(full,titleCache,&g.titleIdError);
+      if(!isDir&&!g.fingerprint) g.fingerprint=fingerprintGameFile(full,sst);
+      g.key=stableGameKey(g.titleId,full,sst,isDir,g.fingerprint);
+      migrateGameIdentity(g);
       if(!isDir&&haveStat&&g.titleId){
-        char cached[96]; snprintf(cached,sizeof(cached),"%lld,%lld,%016llx",(long long)sst.st_size,(long long)sst.st_mtime,(unsigned long long)g.titleId);
+        char cached[128]; snprintf(cached,sizeof(cached),"%lld,%lld,%016llx,%016llx",(long long)sst.st_size,(long long)sst.st_mtime,(unsigned long long)g.titleId,(unsigned long long)g.fingerprint);
         storeSet(refreshedContainerTitles,g.key.c_str(),cached);
+        storeSet(refreshedContainerTitles,g.legacyKey.c_str(),cached);
       }
       g_games.push_back(std::move(g));
     }
@@ -1778,7 +2364,7 @@ static void scanGames(const std::vector<std::string> &sourcePaths) {
     Game g;
     g.titleId = t.titleId;
     g.iconPath = t.iconPath;
-    char idkey[24]; snprintf(idkey, sizeof(idkey), "%016llx", (unsigned long long)t.titleId);
+    char idkey[40]; snprintf(idkey, sizeof(idkey), "wiiu-installed-%016llx", (unsigned long long)t.titleId);
     g.key = idkey;
     g.file = idkey;
     const char *ct = storeGet(g_titles, g.key.c_str(), "");
@@ -1796,51 +2382,411 @@ static void scanGames(const std::vector<std::string> &sourcePaths) {
   if(cacheChanged) storeSave(g_containerTitles,CONTAINER_TITLES_INI);
   applySort();
 }
+
+struct LibraryScanState {
+  std::mutex mutex;
+  std::deque<Game> ready;
+  Store refreshedContainerTitles;
+  Store refreshedIdentities;
+  Store publishedIdentities;
+  std::vector<std::string> completedSources;
+  std::unordered_set<std::string> foundPaths;
+  std::atomic<bool> cancel{false};
+  std::atomic<bool> done{false};
+  bool replace=true;
+  bool cleared=false;
+  size_t unsortedPublished=0;
+  std::thread worker;
+};
+static std::shared_ptr<LibraryScanState> g_libraryScan;
+
+static void wakeUiFromWorker(int code) {
+  if(!g_sdlReady) return;
+  SDL_Event event{}; event.type=SDL_USEREVENT; event.user.code=code; SDL_PushEvent(&event);
+}
+static void usbStatusWake(void*) { wakeUiFromWorker(0x55534248); }
+
+static void libraryScanWorker(const std::shared_ptr<LibraryScanState> &state,
+                              std::vector<std::string> sources,Store titles,Store recent,
+                              Store containerTitles,Store identities) {
+  auto titleCache=cemu_loadTitleCache(std::string(DATA_DIR)+"/title_list_cache.xml");
+  std::unordered_set<std::string> seenPaths;
+  std::unordered_set<std::string> usedIdentities;
+  std::unordered_set<std::string> reservedIds;
+  std::unordered_set<std::string> reservedCanonicalPaths;
+  state->refreshedIdentities=identities; // Offline/unmounted scopes remain reserved.
+  for(const KV &entry:identities.kv){
+    GameIdentityRecord record;
+    if(!parseIdentityRecord(entry,record)||record.retired)continue;
+    reservedIds.insert(record.key);
+    if(!record.canonicalPath.empty()&&identityPathExists(record))
+      reservedCanonicalPaths.insert(record.canonicalPath);
+  }
+  auto publish=[&](Game game){
+    if(state->cancel.load()) return;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const char *identity=storeGet(state->refreshedIdentities,game.key.c_str(),"");
+    if(identity[0]) storeSet(state->publishedIdentities,game.key.c_str(),identity);
+    state->ready.emplace_back(std::move(game));
+    if(state->ready.size()==1||state->ready.size()%8==0) wakeUiFromWorker(0x5343414e);
+  };
+  for(const std::string &source:sources){
+    if(state->cancel.load()) break;
+    const std::string sourceStorageId=usbStableIdForPath(source);
+    DIR *directory=opendir(source.c_str());
+    if(!directory) continue;
+    std::vector<std::string> names;
+    struct dirent *entry=nullptr;
+    while(!state->cancel.load()&&(entry=readdir(directory))) if(entry->d_name[0]!='.') names.emplace_back(entry->d_name);
+    closedir(directory);
+    state->completedSources.push_back(normalizeLocationPath(source));
+    for(const std::string &name:names){
+      if(state->cancel.load()) break;
+      const std::string full=join(source,name);
+      struct stat info{};
+      const bool exists=SwitchStorage::GetCachedSmbStat(full,&info)||stat(full.c_str(),&info)==0;
+      const bool isDirectory=exists&&S_ISDIR(info.st_mode);
+      struct stat codeInfo{};
+      const bool isGameDirectory=isDirectory&&stat((full+"/code").c_str(),&codeInfo)==0;
+      if(!isGameDirectory&&(isDirectory||!hasGameExt(name.c_str()))) continue;
+      if(!seenPaths.insert(pathIdentity(full)).second) continue;
+      Game game;
+      game.file=name;game.path=full;game.storageId=sourceStorageId;
+      game.legacyKey=makeGameKey(game.file,full); game.key=game.legacyKey;
+      if(exists){ game.added=(long long)info.st_mtime; game.modified=game.added; game.fileSize=(long long)info.st_size; }
+      if(!isDirectory&&exists){
+        const char *cached=storeGet(containerTitles,game.legacyKey.c_str(),"");
+        long long size=0,mtime=0; unsigned long long id=0,fingerprint=0; int consumed=0;
+        const int parsed=sscanf(cached,"%lld,%lld,%llx,%llx%n",&size,&mtime,&id,&fingerprint,&consumed);
+        if(parsed>=3&&cached[consumed]==0&&size==(long long)info.st_size&&mtime==(long long)info.st_mtime&&(id>>48)==0x0005){
+          game.titleId=(uint64_t)id;
+          if(parsed==4) game.fingerprint=(uint64_t)fingerprint;
+        }
+      }
+      if(!game.titleId) game.titleId=cemu_resolveBaseTitleId(full,titleCache,&game.titleIdError);
+      if(!isDirectory&&!game.fingerprint) game.fingerprint=fingerprintGameFile(full,info);
+      if(isDirectory&&!game.fingerprint) game.fingerprint=fingerprintGameDirectory(full,game.titleId);
+      const std::string canonical=canonicalGamePath(full);
+      game.key=choosePersistentGameKey(state->refreshedIdentities,state->refreshedIdentities,usedIdentities,
+                                        reservedIds,reservedCanonicalPaths,
+                                        game.titleId,game.fingerprint,
+                                        identityFormat(full,isDirectory),canonical,full);
+      state->foundPaths.insert(pathIdentity(full));
+      const char *custom=storeGet(titles,game.key.c_str(),"");
+      if(!custom[0]) custom=storeGet(titles,game.legacyKey.c_str(),"");
+      game.title=custom[0]?custom:cleanTitle(game.file);
+      game.region=detectRegion(game.file);
+      const char *played=storeGet(recent,game.key.c_str(),"");
+      if(!played[0]) played=storeGet(recent,game.legacyKey.c_str(),"0");
+      game.played=atoll(played);
+      game.hasCfg=gameFileExists(GAMECFG_DIR,game,".ini") ||
+                  regularFileExists(std::string(GAMECFG_DIR)+"/"+game.legacyKey+".ini");
+      if(!isDirectory&&exists&&game.titleId){
+        char cached[128]; snprintf(cached,sizeof(cached),"%lld,%lld,%016llx,%016llx",game.fileSize,game.modified,
+                                  (unsigned long long)game.titleId,(unsigned long long)game.fingerprint);
+        storeSet(state->refreshedContainerTitles,game.key.c_str(),cached);
+        storeSet(state->refreshedContainerTitles,game.legacyKey.c_str(),cached);
+      }
+      publish(std::move(game));
+    }
+  }
+  if(!state->cancel.load()) for(auto &title:cemu_scanMlcTitles(std::string(DATA_DIR)+"/mlc01")){
+    if(state->cancel.load()) break;
+    Game game; game.titleId=title.titleId; game.iconPath=title.iconPath;
+    char id[40]; snprintf(id,sizeof(id),"wiiu-installed-%016llx",(unsigned long long)title.titleId);
+    game.key=id; game.file=id;
+    const char *custom=storeGet(titles,game.key.c_str(),"");
+    game.title=custom[0]?custom:(title.name.empty()?game.key:title.name);
+    game.played=atoll(storeGet(recent,game.key.c_str(),"0"));
+    struct stat profile{};
+    game.hasCfg=stat((std::string(GAMEPROFILES_DIR)+"/"+game.key+".ini").c_str(),&profile)==0;
+    publish(std::move(game));
+  }
+  state->done=true;
+  wakeUiFromWorker(0x5343414e);
+}
+
+static void stopGameScan() {
+  const auto state=g_libraryScan;
+  if(!state) return;
+  state->cancel=true;
+  if(state->worker.joinable()) state->worker.join();
+  g_libraryScan.reset();
+}
+
+static void startGameScan(std::vector<std::string> sources,bool replace=true) {
+  stopGameScan();
+  if(replace)cancelQueuedCoverDecodes();
+  // Publish the SD/local first page before slower removable/network roots.
+  // stable_sort preserves the user's ordering within each storage class.
+  std::stable_sort(sources.begin(),sources.end(),[](const std::string &left,const std::string &right){
+    auto rank=[](const std::string &path){
+      if(path.rfind("cemusmb_",0)==0) return 2;
+      if(path.size()>=5&&path[0]=='u'&&path[1]=='m'&&path[2]=='s'&&
+         isdigit((unsigned char)path[3])&&path[4]==':') return 1;
+      return 0;
+    };
+    return rank(left)<rank(right);
+  });
+  auto state=std::make_shared<LibraryScanState>();
+  state->replace=replace;
+  state->worker=std::thread(libraryScanWorker,state,std::move(sources),g_titles,g_recent,
+                            g_containerTitles,g_gameIdentities);
+  g_libraryScan=std::move(state);
+}
+
+static bool pumpGameScan() {
+  const auto state=g_libraryScan;
+  if(!state) return false;
+  std::vector<Game> batch;
+  Store publishedIdentities;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    // Stable-identity migration and file checks still happen on the SDL
+    // thread. Keep that work bounded so input/rendering never waits on a
+    // large ready batch.
+    const size_t count=std::min(size_t{2},state->ready.size());
+    batch.reserve(count);
+    for(size_t i=0;i<count;i++){
+      batch.emplace_back(std::move(state->ready.front()));
+      state->ready.pop_front();
+    }
+    publishedIdentities.kv.swap(state->publishedIdentities.kv);
+  }
+  if(!publishedIdentities.kv.empty()){
+    // Persist identities at the same time games become visible. A user can
+    // immediately launch or forward a progressive result, so cancellation or
+    // teardown must not discard the key that was already exposed.
+    for(const KV &entry:publishedIdentities.kv)
+      storeSet(g_gameIdentities,entry.k.c_str(),entry.v.c_str());
+    storeSave(g_gameIdentities,GAME_IDENTITIES_INI);
+  }
+  if(!batch.empty()&&state->replace&&!state->cleared){
+    for(Game &game:g_games) if(game.cover) SDL_DestroyTexture(game.cover);
+    g_games.clear(); state->cleared=true;
+  }
+  for(Game &game:batch){
+    migrateGameIdentity(game);
+    auto existing=std::find_if(g_games.begin(),g_games.end(),[&](const Game &candidate){return candidate.key==game.key;});
+    if(existing==g_games.end()) g_games.emplace_back(std::move(game));
+    else {
+      const bool metadataUnchanged=existing->fingerprint==game.fingerprint;
+      if(metadataUnchanged){
+        game.cover=existing->cover;game.triedCover=existing->triedCover;
+        game.coverQueued=existing->coverQueued;game.coverRequest=existing->coverRequest;
+        game.coverAt=existing->coverAt;game.coverUse=existing->coverUse;
+      }else if(existing->cover)SDL_DestroyTexture(existing->cover);
+      *existing=std::move(game);
+    }
+  }
+  if(!batch.empty()){
+    state->unsortedPublished+=batch.size();
+    // Keep the first maximum-sized page ordered, then amortize sorting as the
+    // library grows instead of sorting the whole vector for every tiny batch.
+    if(g_games.size()<=24||state->unsortedPublished>=16){
+      applySort();state->unsortedPublished=0;
+    }else rebuildLibraryView();
+  }
+  bool readyEmpty=false;
+  { std::lock_guard<std::mutex> lock(state->mutex); readyEmpty=state->ready.empty(); }
+  if(state->done.load()&&readyEmpty){
+    if(state->worker.joinable()) state->worker.join();
+    if(state->replace&&!state->cleared){
+      for(Game &game:g_games) if(game.cover) SDL_DestroyTexture(game.cover);
+      g_games.clear(); state->cleared=true;
+    } else if(!state->replace){
+      for(auto iterator=g_games.begin();iterator!=g_games.end();){
+        const bool targeted=std::any_of(state->completedSources.begin(),state->completedSources.end(),
+          [&](const std::string &source){return pathAtOrBelow(iterator->path,source);});
+        if(targeted&&!state->foundPaths.count(pathIdentity(iterator->path))){
+          if(iterator->cover) SDL_DestroyTexture(iterator->cover);
+          iterator=g_games.erase(iterator);
+        } else ++iterator;
+      }
+      applySort();
+    }
+    if(state->replace) g_containerTitles=std::move(state->refreshedContainerTitles);
+    else for(const KV &entry:state->refreshedContainerTitles.kv)
+      storeSet(g_containerTitles,entry.k.c_str(),entry.v.c_str());
+    storeSave(g_containerTitles,CONTAINER_TITLES_INI);
+    if(state->replace) g_gameIdentities=std::move(state->refreshedIdentities);
+    else for(const KV &entry:state->refreshedIdentities.kv)
+      storeSet(g_gameIdentities,entry.k.c_str(),entry.v.c_str());
+    storeSave(g_gameIdentities,GAME_IDENTITIES_INI);
+    storeSave(g_titles,TITLES_INI); storeSave(g_recent,RECENT_INI);
+    g_libraryScan.reset();
+  }
+  return !batch.empty();
+}
+
+static void removeGamesFromUsbDevices(const std::unordered_set<std::string> &deviceIds) {
+  if(deviceIds.empty()) return;
+  for(auto iterator=g_games.begin();iterator!=g_games.end();){
+    if(!iterator->storageId.empty()&&deviceIds.count(iterator->storageId)){
+      if(iterator->cover) SDL_DestroyTexture(iterator->cover);
+      iterator=g_games.erase(iterator);
+    } else ++iterator;
+  }
+  applySort();
+}
 static std::string coverPath(const Game &g) { return std::string(COVERS_DIR) + "/" + g.key + ".png"; }
 static std::string existingCoverPath(const Game &g) {
   return coverPath(g);
 }
 
 static Game *findGameByKey(const std::string &key) {
+  const std::string folded=foldedKey(key);
   for (auto &game : g_games)
-    if (game.key == key) return &game;
+    if (foldedKey(game.key)==folded||foldedKey(game.legacyKey)==folded) return &game;
   return nullptr;
 }
 
-static constexpr int COVER_DECODE_BUDGET = 3;
+static constexpr int COVER_REQUEST_BUDGET = 48;
+static constexpr int COVER_UPLOAD_BUDGET = 2;
+static constexpr size_t COVER_JOB_LIMIT = 96;
+static constexpr size_t COVER_READY_LIMIT = 4;
 static int g_cover_budget = 1 << 30;
 
-// Limit decoded width; source images can be much larger than their grid cells.
-static SDL_Texture *loadCoverTexture(const std::string &path) {
-  SDL_Surface *s = IMG_Load(path.c_str());
-  if (!s) return nullptr;
-  const int MAXW = 360, MAXH = 540;
-  int width=s->w,height=s->h;
-  if(width>MAXW){ height=(int)((long long)height*MAXW/width); width=MAXW; }
-  if(height>MAXH){ width=(int)((long long)width*MAXH/height); height=MAXH; }
-  if(width<1) width=1;
-  if(height<1) height=1;
-  if (width != s->w || height != s->h) {
-    SDL_Surface *d = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_RGBA32);
-    if (!d) { SDL_FreeSurface(s); return nullptr; }
-    SDL_BlendMode blend=SDL_BLENDMODE_NONE;
-    SDL_GetSurfaceBlendMode(s,&blend);
-    SDL_SetSurfaceBlendMode(s,SDL_BLENDMODE_NONE);
-    const bool scaled=SDL_BlitScaled(s,nullptr,d,nullptr)==0;
-    SDL_SetSurfaceBlendMode(s,blend);
-    SDL_FreeSurface(s);
-    if(!scaled){ SDL_FreeSurface(d); return nullptr; }
-    s=d;
-  }
-  SDL_Texture *t = SDL_CreateTextureFromSurface(g_ren, s);
-  SDL_FreeSurface(s);
-  if (t) SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
-  return t;
+struct CoverDecodeJob {
+  std::string key;
+  std::vector<std::string> paths;
+  Uint64 request=0;
+  Uint64 epoch=0;
+};
+struct CoverDecodeResult {
+  std::string key;
+  Uint64 request=0;
+  Uint64 epoch=0;
+  int width=0,height=0;
+  std::vector<Uint8> pixels;
+};
+static std::mutex g_coverDecodeMutex;
+static std::condition_variable g_coverDecodeCondition;
+static std::deque<CoverDecodeJob> g_coverDecodeJobs;
+static std::deque<CoverDecodeResult> g_coverDecodeReady;
+static std::thread g_coverDecodeWorker;
+static bool g_coverDecodeStarted=false,g_coverDecodeStop=false;
+static Uint64 g_coverDecodeEpoch=1,g_coverRequestSerial=0;
+
+static std::vector<std::string> coverCandidatePaths(const Game &game){
+  std::vector<std::string> paths{coverPath(game)};
+  if(!game.iconPath.empty()&&game.iconPath!=paths.front())paths.emplace_back(game.iconPath);
+  return paths;
 }
-static SDL_Texture *loadArt(const Game &g) {
-  SDL_Texture *t = loadCoverTexture(existingCoverPath(g));
-  if (!t && !g.iconPath.empty()) t = loadCoverTexture(g.iconPath);
-  return t;
+
+static CoverDecodeResult decodeCover(const CoverDecodeJob &job){
+  CoverDecodeResult result;result.key=job.key;result.request=job.request;result.epoch=job.epoch;
+  SDL_Surface *source=nullptr;
+  // Probe the custom cover and Cemu icon on this worker; page navigation does
+  // no image filesystem I/O on the rendering thread.
+  for(const std::string &path:job.paths){source=IMG_Load(path.c_str());if(source)break;}
+  if(!source||source->w<1||source->h<1||source->w>8192||source->h>8192||
+     (Uint64)source->w*(Uint64)source->h>16ull*1024*1024){
+    if(source)SDL_FreeSurface(source);
+    return result;
+  }
+  constexpr int maxWidth=360,maxHeight=540;
+  int width=source->w,height=source->h;
+  if(width>maxWidth){height=(int)((long long)height*maxWidth/width);width=maxWidth;}
+  if(height>maxHeight){width=(int)((long long)width*maxHeight/height);height=maxHeight;}
+  width=std::max(1,width);height=std::max(1,height);
+  SDL_Surface *rgba=SDL_CreateRGBSurfaceWithFormat(0,width,height,32,SDL_PIXELFORMAT_RGBA32);
+  if(!rgba){SDL_FreeSurface(source);return result;}
+  SDL_BlendMode blend=SDL_BLENDMODE_NONE;SDL_GetSurfaceBlendMode(source,&blend);
+  SDL_SetSurfaceBlendMode(source,SDL_BLENDMODE_NONE);
+  const bool converted=SDL_BlitScaled(source,nullptr,rgba,nullptr)==0;
+  SDL_SetSurfaceBlendMode(source,blend);SDL_FreeSurface(source);
+  if(!converted){SDL_FreeSurface(rgba);return result;}
+  const bool mustLock=SDL_MUSTLOCK(rgba);
+  if(mustLock&&SDL_LockSurface(rgba)!=0){SDL_FreeSurface(rgba);return result;}
+  result.pixels.resize((size_t)width*(size_t)height*4);
+  for(int row=0;row<height;row++)memcpy(
+      result.pixels.data()+(size_t)row*(size_t)width*4,
+      (const Uint8*)rgba->pixels+(size_t)row*(size_t)rgba->pitch,(size_t)width*4);
+  if(mustLock)SDL_UnlockSurface(rgba);
+  SDL_FreeSurface(rgba);result.width=width;result.height=height;
+  return result;
+}
+
+static void coverDecodeThread(){
+  for(;;){
+    CoverDecodeJob job;
+    {
+      std::unique_lock<std::mutex> lock(g_coverDecodeMutex);
+      g_coverDecodeCondition.wait(lock,[]{return g_coverDecodeStop||
+          (!g_coverDecodeJobs.empty()&&g_coverDecodeReady.size()<COVER_READY_LIMIT);});
+      if(g_coverDecodeStop)return;
+      job=std::move(g_coverDecodeJobs.front());g_coverDecodeJobs.pop_front();
+    }
+    CoverDecodeResult result=decodeCover(job);bool publish=false;
+    {
+      std::lock_guard<std::mutex> lock(g_coverDecodeMutex);
+      if(!g_coverDecodeStop&&job.epoch==g_coverDecodeEpoch){
+        g_coverDecodeReady.emplace_back(std::move(result));publish=true;
+      }
+    }
+    if(publish)wakeUiFromWorker(0x434f5652);
+  }
+}
+
+static void startCoverDecodeWorker(){
+  std::lock_guard<std::mutex> lock(g_coverDecodeMutex);
+  if(g_coverDecodeStarted)return;
+  g_coverDecodeStop=false;g_coverDecodeStarted=true;
+  g_coverDecodeWorker=std::thread(coverDecodeThread);
+}
+
+static void stopCoverDecodeWorker(){
+  {
+    std::lock_guard<std::mutex> lock(g_coverDecodeMutex);
+    if(!g_coverDecodeStarted)return;
+    g_coverDecodeStop=true;g_coverDecodeJobs.clear();g_coverDecodeReady.clear();
+  }
+  g_coverDecodeCondition.notify_all();
+  if(g_coverDecodeWorker.joinable())g_coverDecodeWorker.join();
+  std::lock_guard<std::mutex> lock(g_coverDecodeMutex);g_coverDecodeStarted=false;
+}
+
+static void cancelQueuedCoverDecodes(){
+  {
+    std::lock_guard<std::mutex> lock(g_coverDecodeMutex);
+    ++g_coverDecodeEpoch;g_coverDecodeJobs.clear();g_coverDecodeReady.clear();
+  }
+  for(Game &game:g_games){game.coverQueued=false;game.coverRequest=0;}
+  g_coverDecodeCondition.notify_all();
+}
+
+static void queueCoverDecode(Game &game,bool priority){
+  if(game.cover||game.triedCover)return;
+  if(game.coverQueued){
+    if(priority){
+      std::lock_guard<std::mutex> lock(g_coverDecodeMutex);
+      const auto found=std::find_if(g_coverDecodeJobs.begin(),g_coverDecodeJobs.end(),
+          [&](const CoverDecodeJob &job){return job.request==game.coverRequest;});
+      if(found!=g_coverDecodeJobs.end()&&found!=g_coverDecodeJobs.begin()){
+        CoverDecodeJob job=std::move(*found);g_coverDecodeJobs.erase(found);
+        g_coverDecodeJobs.emplace_front(std::move(job));g_coverDecodeCondition.notify_one();
+      }
+    }
+    return;
+  }
+  if(g_cover_budget<=0)return;
+  --g_cover_budget;
+  CoverDecodeJob job;job.key=game.key;job.paths=coverCandidatePaths(game);
+  job.request=++g_coverRequestSerial;game.coverRequest=job.request;game.coverQueued=true;
+  CoverDecodeJob dropped;bool didDrop=false;
+  {
+    std::lock_guard<std::mutex> lock(g_coverDecodeMutex);job.epoch=g_coverDecodeEpoch;
+    if(g_coverDecodeJobs.size()>=COVER_JOB_LIMIT){
+      dropped=std::move(g_coverDecodeJobs.back());g_coverDecodeJobs.pop_back();didDrop=true;
+    }
+    if(priority)g_coverDecodeJobs.emplace_front(std::move(job));
+    else g_coverDecodeJobs.emplace_back(std::move(job));
+  }
+  if(didDrop)if(Game *old=findGameByKey(dropped.key))if(old->coverRequest==dropped.request){
+    old->coverQueued=false;old->coverRequest=0;
+  }
+  g_coverDecodeCondition.notify_one();
 }
 
 static void touchCover(Game &g) {
@@ -1868,19 +2814,52 @@ static void installCover(Game &g, SDL_Texture *cover) {
   touchCover(g);
 }
 
-static void ensureCover(Game &g) {
+static SDL_Texture *uploadCoverTexture(const CoverDecodeResult &result){
+  if(result.width<1||result.height<1||result.pixels.empty()||!g_ren)return nullptr;
+  SDL_Texture *texture=SDL_CreateTexture(g_ren,SDL_PIXELFORMAT_RGBA32,
+      SDL_TEXTUREACCESS_STATIC,result.width,result.height);
+  if(texture&&SDL_UpdateTexture(texture,nullptr,result.pixels.data(),result.width*4)!=0){
+    SDL_DestroyTexture(texture);texture=nullptr;
+  }
+  if(!texture){
+    SDL_Surface *surface=SDL_CreateRGBSurfaceWithFormatFrom(
+        const_cast<Uint8*>(result.pixels.data()),result.width,result.height,
+        32,result.width*4,SDL_PIXELFORMAT_RGBA32);
+    if(surface){texture=SDL_CreateTextureFromSurface(g_ren,surface);SDL_FreeSurface(surface);}
+  }
+  if(texture)SDL_SetTextureBlendMode(texture,SDL_BLENDMODE_BLEND);
+  return texture;
+}
+
+static void pumpCoverDecodeResults(){
+  int uploads=0,processed=0;
+  while(processed<12){
+    CoverDecodeResult result;
+    {
+      std::lock_guard<std::mutex> lock(g_coverDecodeMutex);
+      if(g_coverDecodeReady.empty())break;
+      if(!g_coverDecodeReady.front().pixels.empty()&&uploads>=COVER_UPLOAD_BUDGET)break;
+      result=std::move(g_coverDecodeReady.front());g_coverDecodeReady.pop_front();
+    }
+    g_coverDecodeCondition.notify_one();++processed;
+    Game *game=findGameByKey(result.key);
+    if(!game||game->coverRequest!=result.request)continue;
+    game->coverQueued=false;game->triedCover=true;
+    if(!result.pixels.empty()){
+      SDL_Texture *texture=uploadCoverTexture(result);++uploads;
+      if(texture)installCover(*game,texture);
+    }
+  }
+}
+
+static void ensureCover(Game &g,bool priority=false) {
   if (g.cover) { touchCover(g); return; }
-  if (g.triedCover) return;
-  if (g_cover_budget <= 0) return;
-  g_cover_budget--;
-  g.triedCover = true;
-  installCover(g, loadArt(g));
+  queueCoverDecode(g,priority);
 }
 static void reloadCover(Game &g) {
   if (g.cover) { SDL_DestroyTexture(g.cover); g.cover = nullptr; }
-  g.coverUse = 0;
-  g.triedCover = true;
-  installCover(g, loadArt(g));
+  g.coverUse=0;g.triedCover=false;g.coverQueued=false;g.coverRequest=0;
+  g_cover_budget=std::max(g_cover_budget,1);queueCoverDecode(g,true);
 }
 
 static bool promptTextMode(const char *header, const char *initial, char *out, size_t outSize,
@@ -1901,6 +2880,19 @@ static bool promptTextMode(const char *header, const char *initial, char *out, s
 }
 static bool promptText(const char *header, const char *initial, char *out, size_t outSize) {
   return promptTextMode(header,initial,out,outSize,false,false);
+}
+
+template<size_t N>
+static bool promptTextStatic(const char (&header)[N],const char *initial,char *out,size_t outSize) {
+  return promptText(LauncherLocalization::Translate(header).data(),initial,out,outSize);
+}
+
+template<size_t N>
+static bool promptTextModeStatic(const char (&header)[N],const char *initial,char *out,size_t outSize,
+                                 bool password,bool allowEmpty,const char *subText=nullptr,
+                                 const char *guideText=nullptr) {
+  return promptTextMode(LauncherLocalization::Translate(header).data(),initial,out,outSize,
+                        password,allowEmpty,subText,guideText);
 }
 
 static bool isTitleFile(const char *name);
@@ -2052,7 +3044,7 @@ static bool transferFrame(TransferState &state) {
   std::string current;
   { std::lock_guard<std::mutex> lock(state.detailMutex); current=state.current; }
   clearUiBackground();
-  drawTextC(g_font_big,SW/2,80,"File transfer",COL_HI);
+  drawStaticTextC(g_font_big,SW/2,80,"File transfer",COL_HI);
   drawTextC(g_font_sm,SW/2,150,ellipsizedText(g_font_sm,current,SW-180).c_str(),COL_DIM);
   int bw=SW*2/3,bx=(SW-bw)/2,by=SH/2-24,bh=42;
   border(bx,by,bw,bh,2,COL_SEL);
@@ -2065,21 +3057,22 @@ static bool transferFrame(TransferState &state) {
   snprintf(text,sizeof(text),"%d%%  -  %.1f / %.1f MiB",percent,done/1048576.0,state.total/1048576.0);
   drawTextC(g_font,SW/2,by+66,text,COL_TXT);
   if(state.cancelled.load())
-    drawTextC(g_font_sm,SW/2,SH-72,"Cancelling...",COL_VAL);
+    drawStaticTextC(g_font_sm,SW/2,SH-72,"Cancelling...",COL_VAL);
   else
-    drawSettingsFooter("B  Cancel",SH-60);
+    drawLocalizedFooter("B  Cancel",SH-60);
   SDL_RenderPresent(g_ren);
   return !state.cancelled.load();
 }
 
 static bool measureTree(const std::string &path,TransferState &state) {
+  if(state.cancelled.load(std::memory_order_relaxed)) return false;
   struct stat st{};
   if(lstat(path.c_str(),&st)!=0){ setTransferDetail(state,{},"Source is no longer available"); return false; }
   if(S_ISREG(st.st_mode)){ state.total+=(uint64_t)st.st_size; return true; }
   if(!S_ISDIR(st.st_mode)){ setTransferDetail(state,{},"Unsupported file type"); return false; }
   DIR *dir=opendir(path.c_str()); if(!dir){ setTransferDetail(state,{},"Could not open a source folder"); return false; }
   bool ok=true; struct dirent *entry;
-  while(ok&&(entry=readdir(dir))){
+  while(ok&&!state.cancelled.load(std::memory_order_relaxed)&&(entry=readdir(dir))){
     if(!strcmp(entry->d_name,".")||!strcmp(entry->d_name,"..")) continue;
     ok=measureTree(join(path,entry->d_name),state);
   }
@@ -2153,20 +3146,20 @@ static bool enoughFreeSpace(const std::string &folder,uint64_t bytes) {
 static bool executePaste(const std::string &folder) {
   if(g_fileClipboard.path.empty()) return false;
   struct stat sourceStat{};
-  if(lstat(g_fileClipboard.path.c_str(),&sourceStat)!=0){ modalMessage("Paste failed",{"The copied item is no longer available."}); g_fileClipboard={}; return false; }
+  if(lstat(g_fileClipboard.path.c_str(),&sourceStat)!=0){ modalMessageStatic("Paste failed",{"The copied item is no longer available."}); g_fileClipboard={}; return false; }
   const std::string destination=join(folder,fileNameOf(g_fileClipboard.path));
   if(pathIdentity(destination)==pathIdentity(g_fileClipboard.path) ||
      (S_ISDIR(sourceStat.st_mode)&&pathAtOrBelow(destination,g_fileClipboard.path))){
-    modalMessage("Paste failed",{"The destination cannot be inside the source."}); return false;
+    modalMessageStatic("Paste failed",{"The destination cannot be inside the source."}); return false;
   }
   struct stat destinationStat{}; bool destinationExists=lstat(destination.c_str(),&destinationStat)==0;
   if(destinationExists&&S_ISDIR(sourceStat.st_mode)){
-    modalMessage("Folder already exists",{"Choose another destination or rename the folder first.",destination}); return false;
+    modalMessageStatic("Folder already exists",{"Choose another destination or rename the folder first.",destination}); return false;
   }
   if(destinationExists&&!S_ISREG(destinationStat.st_mode)){
-    modalMessage("Paste failed",{"The destination is not a regular file."}); return false;
+    modalMessageStatic("Paste failed",{"The destination is not a regular file."}); return false;
   }
-  if(destinationExists&&!confirmBox("Replace existing file?",{fileNameOf(destination),"","The existing file will be replaced."})) return false;
+  if(destinationExists&&!confirmBoxStatic("Replace existing file?",{fileNameOf(destination),"","The existing file will be replaced."})) return false;
 
   bool sameDevice=deviceOf(g_fileClipboard.path)==deviceOf(destination);
   if(g_fileClipboard.move&&sameDevice){
@@ -2174,43 +3167,78 @@ static bool executePaste(const std::string &folder) {
     bool preserved=false;
     if(destinationExists){
       struct stat backupStat{};
-      if(lstat(backup.c_str(),&backupStat)==0||rename(destination.c_str(),backup.c_str())!=0){ modalMessage("Move failed",{"Could not preserve the existing destination."}); return false; }
+      if(lstat(backup.c_str(),&backupStat)==0||rename(destination.c_str(),backup.c_str())!=0){ modalMessageStatic("Move failed",{"Could not preserve the existing destination."}); return false; }
       preserved=true;
     }
     if(rename(g_fileClipboard.path.c_str(),destination.c_str())==0){
       if(preserved) remove(backup.c_str());
       replaceSavedPathPrefix(g_fileClipboard.path,destination);
-      g_fileClipboard={}; toast("Move complete"); SDL_Delay(700); return true;
+      g_fileClipboard={}; toastStatic("Move complete"); return true;
     }
     if(preserved) rename(backup.c_str(),destination.c_str());
   }
 
   TransferState state;
-  if(!measureTree(g_fileClipboard.path,state)){ modalMessage("Paste failed",{transferError(state)}); return false; }
-  if(!enoughFreeSpace(folder,state.total)){ modalMessage("Not enough free space",{"The destination does not have enough available space."}); return false; }
   setTransferDetail(state,fileNameOf(g_fileClipboard.path));
-  bool ok=false;
+  bool ok=false,measured=false,spaceAvailable=true;
   std::atomic<bool> complete{false};
   appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
   std::thread worker([&](){
-    ok=copyTree(g_fileClipboard.path,destination,state);
+    measured=measureTree(g_fileClipboard.path,state);
+    if(measured&&!state.cancelled.load()) spaceAvailable=enoughFreeSpace(folder,state.total);
+    if(measured&&spaceAvailable&&!state.cancelled.load())
+      ok=copyTree(g_fileClipboard.path,destination,state);
     complete.store(true,std::memory_order_release);
+    wakeUiFromWorker(0x46494c45);
   });
   while(!complete.load(std::memory_order_acquire)){
     transferFrame(state);
-    SDL_Delay(8);
+    waitForNextUiFrame();
   }
   worker.join();
   appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+  if(!measured&&!state.cancelled.load()){
+    modalMessageStatic("Paste failed",{transferError(state)}); return false;
+  }
+  if(!spaceAvailable){
+    modalMessageStatic("Not enough free space",{"The destination does not have enough available space."}); return false;
+  }
   if(!ok&&S_ISDIR(sourceStat.st_mode)) removeTreeInternal(destination);
   if(ok&&g_fileClipboard.move){
     if(removeTreeInternal(g_fileClipboard.path)) replaceSavedPathPrefix(g_fileClipboard.path,destination);
-    else { modalMessage("Move incomplete",{"The copy completed, but the original could not be removed completely.","Review both locations before trying again."}); ok=false; }
+    else { modalMessageStatic("Move incomplete",{"The copy completed, but the original could not be removed completely.","Review both locations before trying again."}); ok=false; }
   }
-  if(ok){ g_rescanAfterSettings=true; if(g_fileClipboard.move) g_fileClipboard={}; toast("Transfer complete"); SDL_Delay(700); }
-  else if(state.cancelled.load()){ toast("Transfer cancelled"); SDL_Delay(700); }
-  else { std::string error=transferError(state); modalMessage("Transfer failed",{error.empty()?"The file transfer could not be completed.":error}); }
+  if(ok){ g_rescanAfterSettings=true; if(g_fileClipboard.move) g_fileClipboard={}; toastStatic("Transfer complete"); }
+  else if(state.cancelled.load()){ toastStatic("Transfer cancelled"); }
+  else { std::string error=transferError(state); modalMessageStatic("Transfer failed",{error.empty()?"The file transfer could not be completed.":error}); }
   return ok;
+}
+
+static bool connectSmbInteractive(const SwitchStorage::SmbShare &share,
+                                  bool reconnect,std::string &error) {
+  std::atomic_bool cancel{false},complete{false};
+  bool connected=false;
+  std::thread worker([&]{
+    connected=reconnect?SwitchStorage::ReconnectSmb(share.id,&error,&cancel):
+                        SwitchStorage::MountSmb(share,&error,&cancel);
+    complete=true; wakeUiFromWorker(0x534d4243);
+  });
+  while(!complete.load(std::memory_order_acquire)){
+    if(!beginUiFrame()){ cancel=true; break; }
+    SDL_Event event;
+    while(pollUiEvent(event)){
+      pumpStick(event); int x=0,y=0;
+      if((event.type==SDL_CONTROLLERBUTTONDOWN&&event.cbutton.button==BTN_CANCEL)||
+         (touchFeed(event,&x,&y)==TOUCH_TAP&&y>=SH-90)) cancel=true;
+    }
+    clearUiBackground(); drawHeaderStatic("SMB network shares",nullptr);
+    drawTextC(g_font,SW/2,SH/2-10,LauncherLocalization::Translate(
+      cancel.load()?"Cancelling...":"Connecting...").data(),COL_TXT);
+    drawLocalizedFooter("B  Cancel");
+    SDL_RenderPresent(g_ren); waitForNextUiFrame();
+  }
+  if(worker.joinable()) worker.join();
+  return connected&&!cancel.load();
 }
 
 static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
@@ -2244,9 +3272,9 @@ static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
   auto sharedFolder=[&](){ return edited.path.empty()?edited.share:edited.share+"/"+edited.path; };
   auto validate=[&](){
     edited.name=trim(edited.name); cleanServer(); cleanShare();
-    if(edited.name.empty()){ modalMessage("Display name required",{"Enter a name used to identify this share in Cemu."}); return false; }
+    if(edited.name.empty()){ modalMessageStatic("Display name required",{"Enter a name used to identify this share in Cemu."}); return false; }
     if(edited.server.empty()||edited.server.find('/')!=std::string::npos||edited.server.find('\\')!=std::string::npos){
-      modalMessage("Invalid SMB server",{"Enter only a host name or IP address.","Example: 192.168.1.20"}); return false;
+      modalMessageStatic("Invalid SMB server",{"Enter only a host name or IP address.","Example: 192.168.1.20"}); return false;
     }
     bool invalidPath=edited.share.empty()||edited.share.find(':')!=std::string::npos;
     size_t start=0;
@@ -2258,23 +3286,23 @@ static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
       start=slash+1;
     }
     if(invalidPath){
-      modalMessage("Invalid SMB share",{"Enter a share name, optionally followed by folders.","Do not include a drive letter or smb:// prefix."}); return false;
+      modalMessageStatic("Invalid SMB share",{"Enter a share name, optionally followed by folders.","Do not include a drive letter or smb:// prefix."}); return false;
     }
     return true;
   };
   auto editField=[&](int index){
     char value[256]; bool accepted=false;
-    if(index==0) accepted=promptTextMode("SMB display name",edited.name.c_str(),value,sizeof(value),false,false,
+    if(index==0) accepted=promptTextModeStatic("SMB display name",edited.name.c_str(),value,sizeof(value),false,false,
       "Friendly name shown in the Cemu file browser.","Example: Living room NAS");
-    else if(index==1) accepted=promptTextMode("Server or IP address",edited.server.c_str(),value,sizeof(value),false,false,
+    else if(index==1) accepted=promptTextModeStatic("Server or IP address",edited.server.c_str(),value,sizeof(value),false,false,
       "Enter the network host only. Do not include smb:// or a folder.","Example: 192.168.1.20 or NAS.local");
-    else if(index==2){ std::string folder=sharedFolder(); accepted=promptTextMode("Shared folder",folder.c_str(),value,sizeof(value),false,false,
+    else if(index==2){ std::string folder=sharedFolder(); accepted=promptTextModeStatic("Shared folder",folder.c_str(),value,sizeof(value),false,false,
       "Enter the share and an optional folder path inside it.","Nested folders are supported."); }
-    else if(index==3) accepted=promptTextMode("Username",edited.user.c_str(),value,sizeof(value),false,true,
+    else if(index==3) accepted=promptTextModeStatic("Username",edited.user.c_str(),value,sizeof(value),false,true,
       "Account used by the SMB server. Leave blank for guest access.","Leave blank for guest");
-    else if(index==4) accepted=promptTextMode("Password",edited.password.c_str(),value,sizeof(value),true,true,
+    else if(index==4) accepted=promptTextModeStatic("Password",edited.password.c_str(),value,sizeof(value),true,true,
       "Password for the SMB account. It is stored in launcher.ini.","Leave blank when no password is required");
-    else if(index==5) accepted=promptTextMode("Workgroup",edited.domain.c_str(),value,sizeof(value),false,true,
+    else if(index==5) accepted=promptTextModeStatic("Workgroup",edited.domain.c_str(),value,sizeof(value),false,true,
       "Usually optional on a home network.","Example: WORKGROUP, or leave blank");
     if(!accepted) return;
     if(index==0) edited.name=value;
@@ -2368,11 +3396,11 @@ static bool editSmbShare(SwitchStorage::SmbShare &share,bool creating) {
     drawWrapped(g_font_sm,helpX+28,y0+92,helpWidth-56,helpLineHeight,2,helpLine1[sel],COL_TXT);
     drawWrapped(g_font_sm,helpX+28,y0+156,helpWidth-56,helpLineHeight,2,helpLine2[sel],COL_DIM);
     std::string address="smb://"+(edited.server.empty()?std::string("server"):edited.server)+"/"+(edited.share.empty()?std::string("share"):sharedFolder());
-    drawText(g_font_sm,helpX+28,y0+210,"Connection preview",COL_DIM);
+    drawStaticText(g_font_sm,helpX+28,y0+210,"Connection preview",COL_DIM);
     drawScrollTextL(g_font,helpX+28,y0+244,helpWidth-56,address.c_str(),COL_VAL);
-    drawButtonHint(helpX+28,y0+panelHeight-66,"A","Edit / toggle");
-    drawButtonHint(helpX+28,y0+panelHeight-32,"B","Cancel");
-    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+    drawStaticButtonHint(helpX+28,y0+panelHeight-66,"A","Edit / toggle");
+    drawStaticButtonHint(helpX+28,y0+panelHeight-32,"B","Cancel");
+    drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
   return saved;
 }
@@ -2401,11 +3429,11 @@ static void networkSharesScreen() {
         else if(event.cbutton.button==BTN_CANCEL) return;
         else if(event.cbutton.button==BTN_CONFIRM){
           if(sel==0){
-            if(shares.size()>=8){ toast("Maximum of 8 SMB shares"); SDL_Delay(900); continue; }
+            if(shares.size()>=8){ toastStatic("Maximum of 8 SMB shares"); continue; }
             SwitchStorage::SmbShare share;
             if(editSmbShare(share,true)){
               shares.push_back(share); saveSmbShares(shares);
-              std::string error; if(!SwitchStorage::MountSmb(share,&error)) modalMessage("SMB connection failed",{error});
+              std::string error; if(!connectSmbInteractive(share,false,error)&&!error.empty()) modalMessageStatic("SMB connection failed",{error});
               sel=(int)shares.size(); rebuild=true;
             }
           } else {
@@ -2414,18 +3442,18 @@ static void networkSharesScreen() {
             int action=dropdown(share.name.c_str(),actions,4,0);
             if(action==0){
               if(mounted) SwitchStorage::UnmountSmb(share.id);
-              else { std::string error; if(!SwitchStorage::MountSmb(share,&error)) modalMessage("SMB connection failed",{error}); }
+              else { std::string error; if(!connectSmbInteractive(share,false,error)&&!error.empty()) modalMessageStatic("SMB connection failed",{error}); }
               rebuild=true;
             } else if(action==1){
               SwitchStorage::SmbShare edited=share;
               if(editSmbShare(edited,false)){
                 bool reconnect=mounted||edited.autoMount;
                 SwitchStorage::UnmountSmb(share.id); share=std::move(edited); saveSmbShares(shares);
-                if(reconnect){ std::string error; if(!SwitchStorage::MountSmb(share,&error)) modalMessage("SMB connection failed",{error}); }
+                if(reconnect){ std::string error; if(!connectSmbInteractive(share,false,error)&&!error.empty()) modalMessageStatic("SMB connection failed",{error}); }
                 rebuild=true;
               }
             } else if(action==2){ share.autoMount=!share.autoMount; saveSmbShares(shares); rebuild=true; }
-            else if(action==3&&confirmBox("Remove SMB share?",{share.name,"","Saved folders on this share will also be removed."})){
+            else if(action==3&&confirmBoxStatic("Remove SMB share?",{share.name,"","Saved folders on this share will also be removed."})){
               std::string root=SwitchStorage::SmbRootPath(share.id); SwitchStorage::UnmountSmb(share.id);
               shares.erase(shares.begin()+sel-1); saveSmbShares(shares); removeSavedPathsBelow(root);
               sel=std::max(0,sel-1); rebuild=true;
@@ -2438,11 +3466,11 @@ static void networkSharesScreen() {
       if(rebuild) break;
       clearUiBackground();
       std::string summary=std::to_string(shares.size())+(shares.size()==1?" saved share":" saved shares");
-      drawHeader("SMB network shares",summary.c_str());
+      drawHeaderStatic("SMB network shares",summary.c_str());
       for(int row=0;row<vis&&top+row<n;row++){
         int index=top+row,y=listY+row*rowHeight; bool current=index==sel;
         if(current){ fillRect(56,y-3,SW-112,rowHeight-4,COL_FOCUS); fillRect(56,y-3,5,rowHeight-4,COL_SEL); }
-        if(index==0) drawText(g_font,82,y+(rowHeight-TTF_FontHeight(g_font))/2-2,"[ Add SMB share ]",current?COL_VAL:COL_HI);
+        if(index==0) drawStaticText(g_font,82,y+(rowHeight-TTF_FontHeight(g_font))/2-2,"[ Add SMB share ]",current?COL_VAL:COL_HI);
         else { const auto &share=shares[index-1]; bool mounted=SwitchStorage::IsSmbMounted(share.id);
           drawText(g_font,82,y,share.name.c_str(),current?COL_VAL:COL_TXT);
           std::string status=mounted?"Connected":(share.autoMount?"Disconnected - auto":"Disconnected");
@@ -2450,18 +3478,23 @@ static void networkSharesScreen() {
           std::string address="smb://"+share.server+"/"+share.share+(share.path.empty()?std::string{}:"/"+share.path);
           drawText(g_font_sm,82,y+31,ellipsizedText(g_font_sm,address,SW-340).c_str(),COL_DIM); }
       }
-      drawSettingsFooter("A  Select       B  Back");
-      SDL_RenderPresent(g_ren); SDL_Delay(8);
+      drawLocalizedFooter("A  Select       B  Back");
+    SDL_RenderPresent(g_ren); waitForNextUiFrame();
     }
   }
 }
 
-enum class BrowserMode { SelectFolder, SelectTitle, Manage };
+enum class BrowserMode { SelectFolder, SelectTitle, SelectImage, Manage };
 enum class BrowserItemKind { Use, Up, Paste, Favorite, Directory, File, Location, Smb, ManageSmb };
 struct BrowserItem {
   std::string label,path;
   BrowserItemKind kind=BrowserItemKind::File;
   bool directory=false;
+  std::string stableId;
+  BrowserItem(std::string itemLabel,std::string itemPath,BrowserItemKind itemKind,
+              bool itemDirectory,std::string itemStableId={})
+    : label(std::move(itemLabel)),path(std::move(itemPath)),kind(itemKind),
+      directory(itemDirectory),stableId(std::move(itemStableId)) {}
 };
 
 static bool ensurePathMounted(const std::string &path) {
@@ -2470,8 +3503,9 @@ static bool ensurePathMounted(const std::string &path) {
     if(pathAtOrBelow(path,root)){
       if(SwitchStorage::IsSmbMounted(share.id)) return true;
       std::string error;
-      if(SwitchStorage::MountSmb(share,&error)) return true;
-      modalMessage("SMB connection failed",{share.name,error}); return false;
+      if(connectSmbInteractive(share,false,error)) return true;
+      if(!error.empty()) modalMessageStatic("SMB connection failed",{share.name,error});
+      return false;
     }
   }
   return true;
@@ -2489,29 +3523,22 @@ static bool hasConfiguredUsbSource(const std::vector<std::string> &paths) {
   return std::any_of(paths.begin(),paths.end(),[](const std::string &path){ return isUsbStoragePath(path); });
 }
 
-static bool refreshConfiguredUsbSources(std::vector<std::string> &paths) {
-  if(!hasConfiguredUsbSource(paths)) return false;
-  const auto locations=SwitchStorage::ListUsbLocations();
-  bool changed=false;
-  for(auto &path:paths){
-    if(!isUsbStoragePath(path)) continue;
-    struct stat source{};
-    if(stat(path.c_str(),&source)==0&&S_ISDIR(source.st_mode)) continue;
-    size_t colon=path.find(':');
-    std::string relative=colon==std::string::npos?std::string{}:path.substr(colon+1);
-    while(!relative.empty()&&relative.front()=='/') relative.erase(relative.begin());
-    std::vector<std::string> matches;
-    for(const auto &location:locations){
-      std::string candidate=normalizeLocationPath(location.path+relative);
-      struct stat candidateStat{};
-      if(stat(candidate.c_str(),&candidateStat)==0&&S_ISDIR(candidateStat.st_mode)) matches.push_back(std::move(candidate));
-    }
-    if(matches.size()==1&&pathIdentity(path)!=pathIdentity(matches.front())){
-      path=std::move(matches.front());
-      changed=true;
-    }
+static bool hasConfiguredUsbBinding() {
+  const int count=std::max(0,std::min(16,atoi(storeGet(g_global,"Wrapper/GamePathCount","1"))));
+  for(int index=0;index<count;index++){
+    const std::string key="Wrapper/GamePathStable"+std::to_string(index);
+    if(storeGet(g_global,key.c_str(),"")[0]) return true;
   }
-  if(changed){ saveGameSources(paths); storeSave(g_global,LAUNCHER_INI); }
+  return false;
+}
+
+static bool refreshConfiguredUsbSources(std::vector<std::string> &paths) {
+  // Resolve every saved stable binding from one fresh snapshot. This two-phase
+  // replacement also handles two disks swapping ums aliases without one
+  // source overwriting or deduplicating the other.
+  const std::vector<std::string> resolved=loadGameSources();
+  const bool changed=resolved!=paths;
+  paths=resolved;
   return changed;
 }
 
@@ -2521,10 +3548,10 @@ static void renderUsbForwarderWait() {
   const int panelX=(SW-panelWidth)/2,panelY=(SH-panelHeight)/2;
   glassPanel(panelX,panelY,panelWidth,panelHeight);
   border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
-  drawTextC(g_font_big,SW/2,panelY+42,"Connecting USB storage",COL_SEL);
-  drawTextC(g_font,SW/2,panelY+108,"Waiting for the game drive...",COL_TXT);
-  drawTextC(g_font_sm,SW/2,panelY+150,"The game will start automatically",COL_DIM);
-  drawSettingsFooter("B  Cancel",panelY+190);
+  drawStaticTextC(g_font_big,SW/2,panelY+42,"Connecting USB storage",COL_SEL);
+  drawStaticTextC(g_font,SW/2,panelY+108,"Waiting for the game drive...",COL_TXT);
+  drawStaticTextC(g_font_sm,SW/2,panelY+150,"The game will start automatically",COL_DIM);
+  drawLocalizedFooter("B  Cancel",panelY+190);
   SDL_RenderPresent(g_ren);
 }
 
@@ -2545,7 +3572,7 @@ static std::vector<BrowserItem> browserItems(const std::string &current,BrowserM
   if(current.empty()){
     SwitchStorage::InitializeUsb();
     items.push_back({"SD card","sdmc:/",BrowserItemKind::Location,true});
-    for(const auto &usb:SwitchStorage::ListUsbLocations()) items.push_back({usb.label,usb.path,BrowserItemKind::Location,true});
+    for(const auto &usb:SwitchStorage::ListUsbLocations()) items.push_back({usb.label,usb.path,BrowserItemKind::Location,true,usb.id});
     for(const auto &share:loadSmbSharesFromStore()){
       bool mounted=SwitchStorage::IsSmbMounted(share.id);
       std::string label="SMB - "+(share.name.empty()?share.share:share.name)+(mounted?"":" (disconnected)");
@@ -2573,6 +3600,11 @@ static std::vector<BrowserItem> browserItems(const std::string &current,BrowserM
     if(entry->d_type==DT_UNKNOWN){ struct stat st{}; if(stat(path.c_str(),&st)!=0) continue; directory=S_ISDIR(st.st_mode); }
     if(!directory&&mode==BrowserMode::SelectFolder) continue;
     if(!directory&&mode==BrowserMode::SelectTitle&&!isTitleFile(entry->d_name)) continue;
+    if(!directory&&mode==BrowserMode::SelectImage){
+      const size_t dot=path.find_last_of('.');std::string extension=dot==std::string::npos?std::string{}:path.substr(dot);
+      std::transform(extension.begin(),extension.end(),extension.begin(),[](unsigned char value){return (char)std::tolower(value);});
+      if(extension!=".png"&&extension!=".jpg"&&extension!=".jpeg"&&extension!=".webp"&&extension!=".bmp")continue;
+    }
     entries.push_back({std::string(entry->d_name)+(directory?"/":""),path,directory?BrowserItemKind::Directory:BrowserItemKind::File,directory});
   }
   closedir(dir);
@@ -2589,12 +3621,12 @@ static bool toggleFavorite(const std::string &path) {
   auto iterator=std::find_if(favorites.begin(),favorites.end(),[&](const std::string &entry){ return pathIdentity(entry)==identity; });
   bool pinned=iterator==favorites.end();
   if(pinned){
-    if(favorites.size()>=24){ toast("Maximum of 24 pinned folders"); SDL_Delay(900); return false; }
+    if(favorites.size()>=24){ toastStatic("Maximum of 24 pinned folders"); return false; }
     ensureSavedPathMountedAtStartup(path);
     favorites.push_back(normalizeLocationPath(path));
   }
   else favorites.erase(iterator);
-  saveFavoriteFolders(favorites); toast(pinned?"Folder pinned":"Folder unpinned"); SDL_Delay(650); return true;
+  saveFavoriteFolders(favorites); toast(pinned?"Folder pinned":"Folder unpinned"); return true;
 }
 
 static bool browserActions(const BrowserItem &item,BrowserMode mode) {
@@ -2610,22 +3642,29 @@ static bool browserActions(const BrowserItem &item,BrowserMode mode) {
   }
   if(labels.empty()) return false;
   std::vector<const char*> choices; for(const auto &label:labels) choices.push_back(label.c_str());
-  int action=dropdown("File options",choices.data(),(int)choices.size(),0);
+  int action=dropdownStaticTitle("File options",choices.data(),(int)choices.size(),0);
   if(action<0) return false;
-  if(mode==BrowserMode::Manage&&action==0){ g_fileClipboard={item.path,false}; toast("Copied to clipboard"); SDL_Delay(600); return false; }
-  if(mode==BrowserMode::Manage&&action==1){ g_fileClipboard={item.path,true}; toast("Move queued"); SDL_Delay(600); return false; }
+  if(mode==BrowserMode::Manage&&action==0){ g_fileClipboard={item.path,false}; toastStatic("Copied to clipboard"); return false; }
+  if(mode==BrowserMode::Manage&&action==1){ g_fileClipboard={item.path,true}; toastStatic("Move queued"); return false; }
   if(mode==BrowserMode::Manage&&action==2){
     char name[256]; std::string oldName=fileNameOf(item.path);
-    if(!promptText("Rename",oldName.c_str(),name,sizeof(name))) return false;
+    if(!promptTextStatic("Rename",oldName.c_str(),name,sizeof(name))) return false;
     std::string newName=trim(name);
-    if(!validEntryName(newName)){ modalMessage("Invalid name",{"Names cannot contain /, \\, :, or control characters."}); return false; }
+    if(!validEntryName(newName)){ modalMessageStatic("Invalid name",{"Names cannot contain /, \\, :, or control characters."}); return false; }
     std::string destination=join(parentFolder(item.path),newName); struct stat st{};
-    if(lstat(destination.c_str(),&st)==0){ modalMessage("Rename failed",{"An item with that name already exists."}); return false; }
-    if(rename(item.path.c_str(),destination.c_str())!=0){ modalMessage("Rename failed",{strerror(errno)}); return false; }
-    replaceSavedPathPrefix(item.path,destination); toast("Renamed"); SDL_Delay(600); return true;
+    if(lstat(destination.c_str(),&st)==0){ modalMessageStatic("Rename failed",{"An item with that name already exists."}); return false; }
+    if(rename(item.path.c_str(),destination.c_str())!=0){ modalMessageStatic("Rename failed",{std::string(strerror(errno))}); return false; }
+    replaceSavedPathPrefix(item.path,destination); toastStatic("Renamed"); return true;
   }
   if(canPin) return toggleFavorite(item.path);
   return false;
+}
+
+static std::string usbLocationForPath(const std::string &path) {
+  if(path.empty()) return {};
+  for(const auto &location:SwitchStorage::ListUsbLocations())
+    if(pathAtOrBelow(path,normalizeLocationPath(location.path))) return location.id;
+  return {};
 }
 
 static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
@@ -2634,7 +3673,7 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
   int sel=0,top=0;
   for(;;){
     bool opened=false; auto items=browserItems(current,mode,opened);
-    if(!opened){ modalMessage("Folder unavailable",{current,"","The device may be disconnected."}); current.clear(); sel=top=0; continue; }
+    if(!opened){ modalMessageStatic("Folder unavailable",{current,"","The device may be disconnected."}); current.clear(); sel=top=0; continue; }
     int n=(int)items.size(),vis=std::max(1,(SH-178)/46); if(n==0){ current.clear(); continue; }
     sel=std::max(0,std::min(sel,n-1)); if(sel<top)top=sel; if(sel>=top+vis)top=sel-vis+1;
     bool rebuild=false;
@@ -2655,6 +3694,25 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
         else if(event.cbutton.button==BTN_CANCEL){ if(current.empty()) return {}; current=parentFolder(current); sel=top=0; rebuild=true; }
         else if(event.cbutton.button==BTN_SETTINGS){ if(browserActions(items[sel],mode)) rebuild=true; }
         else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_X&&mode==BrowserMode::Manage&&!current.empty()&&!g_fileClipboard.path.empty()){ executePaste(current); rebuild=true; }
+        else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_START&&mode==BrowserMode::Manage){
+          std::string stableId=!items[sel].stableId.empty()?items[sel].stableId:usbLocationForPath(current.empty()?items[sel].path:current);
+          if(!stableId.empty()){
+            std::string label=items[sel].label;
+            for(const auto &location:SwitchStorage::ListUsbLocations()) if(location.id==stableId){ label=location.label; break; }
+            if(confirmBoxStatic("Safely eject USB drive?",{label,"Close files using this drive before ejecting."})){
+              // A scanner can still own DIR/stat state for this filesystem.
+              // Fence it before libusbhsfs unmounts the device, then request a
+              // stable-ID reconciliation when returning to the library.
+              stopGameScan();
+              std::string error;
+              if(SwitchStorage::SafelyEjectUsb(stableId,&error)){
+                g_rescanAfterSettings=true;
+                toastStatic("USB drive can now be removed"); current.clear(); sel=top=0; rebuild=true;
+              } else modalMessageStatic("USB eject failed",{error});
+            }
+            beginScreenFx();
+          }
+        }
         else if(event.cbutton.button==BTN_CONFIRM){
           const BrowserItem item=items[sel];
           if(item.kind==BrowserItemKind::Use) return item.path;
@@ -2664,8 +3722,9 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
           else if(item.kind==BrowserItemKind::ManageSmb){ networkSharesScreen(); sel=top=0; rebuild=true; }
           else if(item.kind==BrowserItemKind::Directory){ current=item.path; sel=top=0; rebuild=true; }
           else if(item.kind==BrowserItemKind::File&&mode==BrowserMode::SelectTitle) return item.path;
+          else if(item.kind==BrowserItemKind::File&&mode==BrowserMode::SelectImage) return item.path;
           else if(item.kind==BrowserItemKind::Location||item.kind==BrowserItemKind::Smb){
-            if(ensurePathMounted(item.path)){ DIR *test=opendir(item.path.c_str()); if(test){ closedir(test); current=item.path; sel=top=0; rebuild=true; } else modalMessage("Location unavailable",{item.path}); }
+            if(ensurePathMounted(item.path)){ DIR *test=opendir(item.path.c_str()); if(test){ closedir(test); current=item.path; sel=top=0; rebuild=true; } else modalMessageStatic("Location unavailable",{item.path}); }
           }
         }
         if(sel<top) top=sel;
@@ -2673,7 +3732,8 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
       }
       if(rebuild) break;
       clearUiBackground();
-      const char *title=mode==BrowserMode::Manage?"File manager":mode==BrowserMode::SelectTitle?"Select title":"Select game folder";
+      const char *title=mode==BrowserMode::Manage?"File manager":mode==BrowserMode::SelectTitle?"Select title":
+                        mode==BrowserMode::SelectImage?"Select local cover":"Select game folder";
       drawText(g_font_big,64,30,title,COL_HI);
       drawTextR(g_font_sm,SW-64,48,current.empty()?"Locations":ellipsizedText(g_font_sm,current,SW/2).c_str(),COL_DIM);
       for(int row=0;row<vis&&top+row<n;row++){
@@ -2682,15 +3742,23 @@ static std::string runFileBrowser(const std::string &start,BrowserMode mode) {
         SDL_Color color=item.kind==BrowserItemKind::Use||item.kind==BrowserItemKind::Paste||item.kind==BrowserItemKind::Favorite?COL_HI:(item.directory?COL_TXT:(SDL_Color){120,220,120,255});
         drawText(g_font,80,y,ellipsizedText(g_font,item.label,SW-180).c_str(),selected?COL_VAL:color);
       }
-      std::string footer=mode==BrowserMode::Manage?"A  Open       X  Actions       Y  Paste       B  Back":"A  Open / Select       X  Pin       B  Back";
-      drawSettingsFooter(footer.c_str());
-      SDL_RenderPresent(g_ren); SDL_Delay(8);
+      const bool canEject=mode==BrowserMode::Manage&&
+        !usbLocationForPath(current.empty()?items[sel].path:current).empty();
+      std::string footer=mode==BrowserMode::Manage?
+        (canEject?"A  Open       X  Actions       Y  Paste       +  Eject       B  Back":"A  Open       X  Actions       Y  Paste       B  Back"):
+        "A  Open / Select       X  Pin       B  Back";
+      drawLocalizedFooter(footer.c_str());
+    SDL_RenderPresent(g_ren); waitForNextUiFrame();
     }
   }
 }
 
 static std::string browseFolder(const std::string &start) {
   return runFileBrowser(start,BrowserMode::SelectFolder);
+}
+
+static std::string browseCoverImage(const std::string &start) {
+  return runFileBrowser(start,BrowserMode::SelectImage);
 }
 
 static void runFileManager() {
@@ -2751,7 +3819,8 @@ static void optValue(const Opt &o, char *out, int n) {
   if (o.type==OT_CHOICE){
     if(o.key&&!strcmp(o.key,"console_language")&&!strcmp(iniGet(o.key,o.def),"-1"))
       snprintf(out,n,"Auto (%s)",g_systemLanguageName);
-    else { int i=choiceIdx(o); snprintf(out,n,"%s", i>=0?o.ch[i].label:iniGet(o.key,o.def)); }
+    else { int i=choiceIdx(o); const char* value=i>=0?o.ch[i].label:iniGet(o.key,o.def);
+           snprintf(out,n,"%s",LauncherLocalization::Translate(value).data()); }
   }
   else if (o.type==OT_RANGE){
     if (o.key && !strcmp(o.key,"AudioDelay")) snprintf(out,n,"%d ms", atoi(iniGet(o.key,o.def))*12);
@@ -2766,8 +3835,18 @@ static void optAdjust(const Opt &o, int dir) {
   else if (o.type==OT_RANGE){ int v=atoi(iniGet(o.key,o.def))+dir*o.step; if(v<o.lo)v=o.lo; if(v>o.hi)v=o.hi; char b[24]; snprintf(b,sizeof(b),"%d",v); iniSet(o.key,b); }
 }
 
+static bool resetOption(const Opt &option) {
+  if(!option.key||!option.def||option.type==OT_ACTION||option.type==OT_STATUS) return false;
+  if(g_active==&g_global) storeSet(g_global,option.key,option.def);
+  else storeRemove(*g_active,option.key);
+  return true;
+}
+
 static bool optionEnabled(int screen,const Opt &option) {
   if(option.type==OT_STATUS) return false;
+  const bool nativeVulkan=!strcmp(iniGet("Wrapper/Renderer","vk"),"vk");
+  if(!nativeVulkan && screen==SCR_FRAMEGEN) return false;
+  if(!nativeVulkan && option.key && !strcmp(option.key,"vkAccurateBarriers")) return false;
   if(screen==SCR_FRAMEGEN&&option.key&&
      (!strcmp(option.key,"Wrapper/LSFGFlowScale")||!strcmp(option.key,"Wrapper/LSFGPerformance")))
     return !strcmp(iniGet("Wrapper/LSFGEnabled","false"),"true")&&regularFileExists(LSFG_DLL_FILE);
@@ -2776,8 +3855,7 @@ static bool optionEnabled(int screen,const Opt &option) {
 
 
 static float g_hy = -1;
-static Uint32 g_fxT = 0;
-static void beginScreenFx(){ g_fxT = SDL_GetTicks(); g_hy = -1; }
+static void beginScreenFx(){ g_fxT=SDL_GetTicks(); g_redrawUntil=g_fxT+220; g_hy=-1; }
 static void drawFadeIn(){
   if(!g_uiAnimations) return;
   const int D = 160; int el = (int)(SDL_GetTicks() - g_fxT);
@@ -2828,18 +3906,20 @@ static void showHelpCard(const char *section,const char *title,const char *kind,
     const int panelX=(SW-panelWidth)/2,panelY=(SH-panelHeight)/2;
     glassPanel(panelX,panelY,panelWidth,panelHeight);
     border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
-    drawText(g_font_sm,panelX+40,panelY+24,section&&*section?section:"Settings",COL_DIM);
-    const char *helpTitle=title&&*title?title:"Setting info";
+    drawText(g_font_sm,panelX+40,panelY+24,section&&*section?section:
+             LauncherLocalization::Translate("Settings").data(),COL_DIM);
+    const char *helpTitle=title&&*title?title:LauncherLocalization::Translate("Setting info").data();
     drawText(g_font_big,panelX+40,panelY+58,
              ellipsizedText(g_font_big,helpTitle,panelWidth-80).c_str(),COL_VAL);
 
-    std::string metadata=kind&&*kind?kind:"Setting";
+    std::string metadata=kind&&*kind?std::string(kind):
+                         std::string(LauncherLocalization::Translate("Setting"));
     if(scope&&*scope){ metadata+="  |  "; metadata+=scope; }
     drawText(g_font_sm,panelX+40,panelY+114,
              ellipsizedText(g_font_sm,metadata,panelWidth-80).c_str(),COL_SEL);
     int bodyY=panelY+164;
     if(current&&*current){
-      const char *prefix="Current: ";
+      const char *prefix=LauncherLocalization::Translate("Current: ").data();
       drawText(g_font_sm,panelX+40,panelY+146,prefix,COL_DIM);
       drawScrollTextL(g_font_sm,panelX+40+textW(g_font_sm,prefix),panelY+146,
                       panelWidth-80-textW(g_font_sm,prefix),current,COL_TXT);
@@ -2847,10 +3927,10 @@ static void showHelpCard(const char *section,const char *title,const char *kind,
     }
     fillRect(panelX+40,bodyY-18,panelWidth-80,2,(SDL_Color){70,78,92,210});
     drawWrapped(g_font,panelX+40,bodyY,panelWidth-80,32,7,description.c_str(),COL_TXT);
-    drawSettingsFooter("A  Close       B  Close       X  Close",panelY+panelHeight-48);
-    drawTextC(g_font_sm,SW/2,panelY+panelHeight-22,"Touch anywhere to close",COL_DIM);
+    drawLocalizedFooter("A  Close       B  Close       X  Close",panelY+panelHeight-48);
+    drawStaticTextC(g_font_sm,SW/2,panelY+panelHeight-22,"Touch anywhere to close",COL_DIM);
     SDL_RenderPresent(g_ren);
-    SDL_Delay(8);
+    waitForNextUiFrame();
   }
 }
 
@@ -2859,7 +3939,11 @@ static void showOptionHelp(const char *section,const Opt &option,const char *sco
   char value[256]={};
   const char *current=nullptr;
   if(option.type!=OT_ACTION){ optValue(option,value,sizeof(value)); current=value; }
-  showHelpCard(section,option.label,help.kind,help.text,current,scope);
+  showHelpCard(LauncherLocalization::Translate(section).data(),
+               LauncherLocalization::Translate(option.label).data(),
+               LauncherLocalization::Translate(help.kind).data(),
+               std::string(LauncherLocalization::Translate(help.text)),current,
+               LauncherLocalization::Translate(scope).data());
 }
 
 static const char *settingsScreenDescription(int screen) {
@@ -2878,7 +3962,7 @@ static const char *settingsScreenDescription(int screen) {
 static void renderSettings(int scr,int sel,int top,const char *ctx){
   clearUiBackground();
   const Screen &S=g_screens[scr];
-  drawHeader(S.title, ctx);
+  drawHeader(LauncherLocalization::Translate(S.title).data(), ctx);
   int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
   int vis=listVis();
   glassPanel(colX-12,LIST_Y0-10,colW+24,vis*ROW_H+18);
@@ -2894,7 +3978,7 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
     SDL_Color vc = enabled?(cur?COL_VAL:COL_DIM):(SDL_Color){92,98,110,255};
     if(S.opts[i].type==OT_STATUS)
       vc=regularFileExists(LSFG_DLL_FILE)?(SDL_Color){120,220,120,255}:(SDL_Color){235,125,115,255};
-    drawText(g_font,labelX,y,S.opts[i].label,lc);
+    drawText(g_font,labelX,y,LauncherLocalization::Translate(S.opts[i].label).data(),lc);
     char v[96]; optValue(S.opts[i],v,sizeof(v));
     drawTextR(g_font,valX,y,v,vc);
   }
@@ -2904,7 +3988,7 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
     int thH=trH*vis/S.n, denom=(S.n-vis>0?S.n-vis:1);
     fillRect(trX,trY+(trH-thH)*top/denom,4,thH,COL_SEL);
   }
-  drawSettingsFooter("Left / Right  Change       A  Choose       X  Info       B  Back");
+  drawLocalizedFooter("Left / Right  Change       A  Choose       Y  Reset       X  Info       B  Back");
   drawFadeIn();
   SDL_RenderPresent(g_ren);
 }
@@ -2949,10 +4033,10 @@ static int dropdown(const char *title, const char *const *labels, int n, int cur
     }
     if(n>vis){ int trH=vis*rowH,trX=px+pw-12,trY=ly; fillRect(trX,trY,4,trH,(SDL_Color){40,44,54,255});
       int thH=trH*vis/n,dn=(n-vis>0?n-vis:1); fillRect(trX,trY+(trH-thH)*top/dn,4,thH,COL_SEL); }
-    drawSettingsFooter("A  Select       B  Back");
+    drawLocalizedFooter("A  Select       B  Back");
     drawFadeIn();
     SDL_RenderPresent(g_ren);
-    SDL_Delay(8);
+    waitForNextUiFrame();
   }
 }
 static void optChoosePopup(const Opt &o) {
@@ -3013,20 +4097,20 @@ static bool mappingInputHeld() {
 
 static void renderMappingPrompt(const InputMapping &mapping,int index,bool releasing,const char *status) {
   clearUiBackground();
-  drawHeader("Control mapping", "Press-to-bind");
+  drawHeaderStatic("Control mapping", "Press-to-bind");
   int panelW=std::min(900,SW-180),panelH=330,panelX=(SW-panelW)/2,panelY=(SH-panelH)/2-20;
   glassPanel(panelX,panelY,panelW,panelH);
   border(panelX,panelY,panelW,panelH,3,COL_SEL);
   char step[48]; snprintf(step,sizeof(step),"Control %d of %d",index+1,(int)(sizeof(C_inputMappings)/sizeof(*C_inputMappings)));
   drawTextC(g_font_sm,SW/2,panelY+36,step,COL_DIM);
   drawTextC(g_font_big,SW/2,panelY+94,mapping.label,COL_VAL);
-  if(releasing) drawTextC(g_font,SW/2,panelY+180,"Release the current button",COL_TXT);
-  else drawTextC(g_font,SW/2,panelY+180,"Press the button or trigger to assign",COL_TXT);
+  if(releasing) drawStaticTextC(g_font,SW/2,panelY+180,"Release the current button",COL_TXT);
+  else drawStaticTextC(g_font,SW/2,panelY+180,"Press the button or trigger to assign",COL_TXT);
   const char *current=iniGet(mapping.key,mapping.def);
   std::string currentLine=std::string("Current: ")+mappingTokenLabel(current);
   drawTextC(g_font_sm,SW/2,panelY+238,status&&*status?status:currentLine.c_str(),status&&*status?COL_HI:COL_DIM);
-  drawSettingsFooter("+  Hold to clear       -  Hold to cancel",SH-72);
-  drawTextC(g_font_sm,SW/2,SH-38,"Touch left to clear       Touch right to cancel",COL_DIM);
+  drawLocalizedFooter("+  Hold to clear       -  Hold to cancel",SH-72);
+  drawStaticTextC(g_font_sm,SW/2,SH-38,"Touch left to clear       Touch right to cancel",COL_DIM);
   SDL_RenderPresent(g_ren);
 }
 
@@ -3036,7 +4120,7 @@ static bool captureMappingInput(const InputMapping &mapping,int index,std::strin
     if (!beginUiFrame()) return false;
     SDL_Event event; while (pollUiEvent(event)) { int x=0,y=0; if(touchFeed(event,&x,&y)==TOUCH_TAP&&y>=SH-92) return false; }
     renderMappingPrompt(mapping,index,true,nullptr);
-    SDL_Delay(8);
+    waitForNextUiFrame();
   }
   releasing=false;
   int heldSpecial=-1;
@@ -3077,7 +4161,7 @@ static bool captureMappingInput(const InputMapping &mapping,int index,std::strin
     const char *status=heldSpecial==SDL_CONTROLLER_BUTTON_START?"Keep holding Plus to clear":"";
     if (heldSpecial==SDL_CONTROLLER_BUTTON_BACK) status="Keep holding Minus to cancel";
     renderMappingPrompt(mapping,index,releasing,status);
-    SDL_Delay(8);
+    waitForNextUiFrame();
   }
 }
 
@@ -3089,14 +4173,14 @@ static void runInputMappingScreen() {
 
   auto assignSelected=[&]() {
     if (!g_pad || !SDL_GameControllerGetAttached(g_pad)) {
-      modalMessage("Control mapping", {"No controller is connected."});
+      modalMessageStatic("Control mapping", {"No controller is connected."});
       beginScreenFx();
       return;
     }
     std::string token;
     if (captureMappingInput(C_inputMappings[sel],sel,token)) {
       iniSet(C_inputMappings[sel].key,token.c_str());
-      toast("Control assigned");
+      toastStatic("Control assigned");
     }
     beginScreenFx();
   };
@@ -3130,6 +4214,10 @@ static void runInputMappingScreen() {
       if (event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP) sel=(sel+count-1)%count;
       else if (event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN) sel=(sel+1)%count;
       else if (event.cbutton.button==BTN_CONFIRM) assignSelected();
+      else if (event.cbutton.button==SDL_CONTROLLER_BUTTON_X) {
+        iniSet(C_inputMappings[sel].key,C_inputMappings[sel].def);
+        toast(LauncherLocalization::Translate("Setting reset to default").data());
+      }
       else if (event.cbutton.button==BTN_CANCEL) { savedSelection=sel; return; }
 
       if (sel<top) top=sel;
@@ -3138,7 +4226,7 @@ static void runInputMappingScreen() {
     }
 
     clearUiBackground();
-    drawHeader("Control mapping","Select a control");
+    drawHeaderStatic("Control mapping","Select a control");
     int colX,colW,labelX,valX;
     listCol(&colX,&colW,&labelX,&valX);
     const int visible=std::min(listVis(),count);
@@ -3164,10 +4252,10 @@ static void runInputMappingScreen() {
       const int denominator=std::max(1,count-visible);
       fillRect(trackX,trackY+(trackHeight-thumbHeight)*top/denominator,4,thumbHeight,COL_SEL);
     }
-    drawSettingsFooter("A  Assign       B  Back");
+    drawLocalizedFooter("A  Assign       Y  Reset       B  Back");
     drawFadeIn();
     SDL_RenderPresent(g_ren);
-    SDL_Delay(8);
+    waitForNextUiFrame();
   }
 }
 
@@ -3184,7 +4272,7 @@ static void runSettings(int scr, const char *ctx) {
     if(scr==SCR_FRAMEGEN && option.key && !strcmp(option.key,"Wrapper/LSFGEnabled") &&
        !strcmp(iniGet(option.key,option.def),"true") && !regularFileExists(LSFG_DLL_FILE)){
       iniSet(option.key,"false");
-      modalMessage("LSFG is not ready", {
+      modalMessageStatic("LSFG is not ready", {
         "Lossless.dll was not found.",
         "Copy it to sdmc:/switch/cemu/lsfg/Lossless.dll",
         "then enable LSFG again."
@@ -3231,13 +4319,16 @@ static void runSettings(int scr, const char *ctx) {
           showOptionHelp(S.title,S.opts[sel],ctx&&*ctx?"Per-game setting":"Global setting");
           beginScreenFx();
           break;
+        case SDL_CONTROLLER_BUTTON_X:
+          if(resetOption(S.opts[sel])) { toast(LauncherLocalization::Translate("Setting reset to default").data()); }
+          break;
         case BTN_CANCEL: return;
       }
       int vis=listVis(); if(sel<top) top=sel; if(sel>=top+vis) top=sel-vis+1; if(top<0)top=0;
       s_setSel[scr]=sel; s_setTop[scr]=top;
     }
     renderSettings(scr,sel,top,ctx);
-    SDL_Delay(8);
+    waitForNextUiFrame();
   }
 }
 
@@ -3283,10 +4374,11 @@ static bool promptAndSaveSteamGridDbKey(const char *header,bool allowEmpty){
 static void launcherSettingsScreen() {
   static int savedSelection=0,savedTop=0;
   const int optionCount=(int)(sizeof(S_launcher)/sizeof(Opt));
-  const int apiKeyRow=optionCount,coversRow=optionCount+1,listCount=optionCount+2;
+  const int apiKeyRow=optionCount,listCount=optionCount+1;
   const int updateRow=listCount,selectionCount=listCount+1;
   int sel=std::max(0,std::min(savedSelection,selectionCount-1)),top=std::max(0,savedTop);
   auto applyChange=[&](){
+    LauncherLocalization::Initialize(storeGet(g_global,"Wrapper/Language","system"));
     applyLauncherAppearance();
     uiAudioSetEnabled(strcmp(storeGet(g_global,"Wrapper/UiSounds","true"),"false")!=0);
   };
@@ -3327,16 +4419,22 @@ static void launcherSettingsScreen() {
       else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN) sel=(sel+1)%selectionCount;
       else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_LEFT&&sel<optionCount){ optAdjust(S_launcher[sel],-1); applyChange(); }
       else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_RIGHT&&sel<optionCount){ optAdjust(S_launcher[sel],1); applyChange(); }
+      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_X){
+        if(sel<optionCount&&resetOption(S_launcher[sel])){
+          applyChange(); toast(LauncherLocalization::Translate("Setting reset to default").data());
+        } else if(sel==apiKeyRow){
+          storeSet(g_global,"Wrapper/SteamGridDBKey","");
+          toast(LauncherLocalization::Translate("Setting reset to default").data());
+        }
+      }
       else if(event.cbutton.button==BTN_CONFIRM){
         if(sel==updateRow){ runUpdateScreen(); beginScreenFx(); }
         else if(sel==apiKeyRow){
           if(promptAndSaveSteamGridDbKey("SteamGridDB API key",true)){
             toast(steamGridDbKey().empty()?"SteamGridDB API key removed":"SteamGridDB API key updated");
-            SDL_Delay(900);
           }
           beginScreenFx();
         }
-        else if(sel==coversRow){ downloadAllCovers(); beginScreenFx(); }
         else {
           const Opt &option=S_launcher[sel];
           if(option.type==OT_CHOICE&&option.nch>2){ optChoosePopup(option); beginScreenFx(); }
@@ -3350,10 +4448,6 @@ static void launcherSettingsScreen() {
           showHelpCard("Launcher","SteamGridDB API key","Online artwork",
                        "Stores the personal SteamGridDB API key used to search and download cover or HOME shortcut artwork. Leave it blank to remove the saved key.",
                        steamGridDbKey().empty()?"Not set":"Configured","Launcher setting");
-        else if(sel==coversRow)
-          showHelpCard("Launcher","Download all covers","Library artwork",
-                       "Downloads missing cover artwork for the whole Cemu library from SteamGridDB. Existing local covers are kept.",
-                       nullptr,"Launcher action");
         else
           showHelpCard("Launcher","Check for Updates","Launcher updates",
                        "Checks the latest published Cemu-nx release, displays its notes, verifies the downloaded NRO, and safely replaces this launcher.",
@@ -3367,7 +4461,7 @@ static void launcherSettingsScreen() {
     }
 
     clearUiBackground();
-    drawHeader("Launcher",nullptr);
+    drawHeader(LauncherLocalization::Translate("Launcher").data(),nullptr);
     int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
     const int visible=std::min(std::max(1,(SH-LIST_Y0-190)/ROW_H),listCount);
     const int fontHeight=TTF_FontHeight(g_font);
@@ -3381,14 +4475,11 @@ static void launcherSettingsScreen() {
     for(int row=0;row<visible&&top+row<listCount;row++){
       int index=top+row,y=LIST_Y0+row*ROW_H+(ROW_H-fontHeight)/2; bool current=index==sel;
       if(index==apiKeyRow){
-        drawText(g_font,labelX,y,"SteamGridDB API key",current?COL_VAL:COL_TXT);
+        drawText(g_font,labelX,y,LauncherLocalization::Translate("SteamGridDB API key").data(),current?COL_VAL:COL_TXT);
         drawTextR(g_font_sm,valX,y+(fontHeight-TTF_FontHeight(g_font_sm))/2,
                   steamGridDbKey().empty()?"Not set":"Configured",current?COL_VAL:COL_DIM);
-      } else if(index==coversRow){
-        drawText(g_font,labelX,y,"Download all covers",current?COL_VAL:COL_TXT);
-        drawTextR(g_font_sm,valX,y+(fontHeight-TTF_FontHeight(g_font_sm))/2,"SteamGridDB",current?COL_VAL:COL_DIM);
       } else {
-        drawText(g_font,labelX,y,S_launcher[index].label,current?COL_VAL:COL_TXT);
+        drawText(g_font,labelX,y,LauncherLocalization::Translate(S_launcher[index].label).data(),current?COL_VAL:COL_TXT);
         char value[96]; optValue(S_launcher[index],value,sizeof(value));
         drawTextR(g_font,valX,y,value,current?COL_VAL:COL_DIM);
       }
@@ -3399,16 +4490,16 @@ static void launcherSettingsScreen() {
     const bool updateSelected=sel==updateRow;
     fillRect(buttonX,buttonY,buttonWidth,buttonHeight,updateSelected?COL_FOCUS:(SDL_Color){35,40,50,225});
     border(buttonX,buttonY,buttonWidth,buttonHeight,2,updateSelected?COL_SEL:COL_DIM);
-    drawTextC(g_font,SW/2,buttonY+(buttonHeight-fontHeight)/2,"Check for Updates",updateSelected?COL_VAL:COL_TXT);
+    drawTextC(g_font,SW/2,buttonY+(buttonHeight-fontHeight)/2,LauncherLocalization::Translate("Check for Updates").data(),updateSelected?COL_VAL:COL_TXT);
     const std::string updateStatus=launcherUpdateStatusText();
     drawTextC(g_font_sm,SW/2,buttonY+buttonHeight+8,updateStatus.c_str(),updateSelected?COL_VAL:COL_DIM);
-    drawSettingsFooter("Left / Right  Change       A  Choose       X  Info       B  Back");
-    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+    drawLocalizedFooter("Left / Right  Change       A  Choose       Y  Reset       X  Info       B  Back");
+    drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
 }
 static void installProgress(int pct) {
   clearUiBackground();
-  drawHeader("Installing title...", nullptr);
+  drawHeaderStatic("Installing title...", nullptr);
   int bw=SW*2/3, bx=(SW-bw)/2, by=SH/2-20, bh=40;
   border(bx,by,bw,bh,2,COL_SEL);
   fillRect(bx+3,by+3,(bw-6)*pct/100,bh-6,COL_HI);
@@ -3420,30 +4511,31 @@ static void doInstallFlow() {
   std::string picked = browseTitleFile("sdmc:/");
   if (picked.empty()) return;
   struct stat st;
-  if (stat(picked.c_str(), &st) != 0) { toast("Not found"); SDL_Delay(1400); return; }
+  if (stat(picked.c_str(), &st) != 0) { toastStatic("Not found"); return; }
   if (S_ISDIR(st.st_mode)) {
     std::string msg;
     int r = cemu_installTitle(picked, std::string(DATA_DIR)+"/mlc01", installProgress, msg);
-    toast(msg.c_str()); SDL_Delay(1600);
+    toast(msg.c_str());
     if (r == 0) { ensureDefaultGameSource(); g_rescanAfterSettings = true; }
   } else {
     std::string fname = picked.substr(picked.find_last_of('/') + 1);
     std::string gamesDir = std::string(DATA_DIR) + "/games";
     std::string dst = gamesDir + "/" + fname;
-    if (picked == dst) { toast("Already in the games folder"); SDL_Delay(1600); return; }
-    if (mkdir(gamesDir.c_str(), 0777) != 0 && errno != EEXIST) { toast("Could not create games folder"); SDL_Delay(1600); return; }
+    if (picked == dst) { toastStatic("Already in the games folder"); return; }
+    if (mkdir(gamesDir.c_str(), 0777) != 0 && errno != EEXIST) { toastStatic("Could not create games folder"); return; }
     struct stat dirStat{};
-    if (stat(gamesDir.c_str(), &dirStat) != 0 || !S_ISDIR(dirStat.st_mode)) { toast("Games path is not a folder"); SDL_Delay(1600); return; }
-    if (!recoverAtomicFile(dst)) { toast("Could not recover previous install"); SDL_Delay(1600); return; }
+    if (stat(gamesDir.c_str(), &dirStat) != 0 || !S_ISDIR(dirStat.st_mode)) { toastStatic("Games path is not a folder"); return; }
+    if (!recoverAtomicFile(dst)) { toastStatic("Could not recover previous install"); return; }
     struct stat dstStat{};
     if (stat(dst.c_str(), &dstStat) == 0) {
-      if (!S_ISREG(dstStat.st_mode)) { toast("Destination is not a file"); SDL_Delay(1600); return; }
-      if (!confirmBox("Replace existing file?", {fname, "", "The existing copy will be replaced."})) return;
+      if (!S_ISREG(dstStat.st_mode)) { toastStatic("Destination is not a file"); return; }
+      if (!confirmBoxStatic("Replace existing file?", {fname, "", "The existing copy will be replaced."})) return;
     } else if (errno != ENOENT) {
-      toast("Could not check destination"); SDL_Delay(1600); return;
+      toastStatic("Could not check destination"); return;
     }
     bool ok = copyFileProgress(picked, dst, (long long)st.st_size, installProgress);
-    toast(ok ? "Installed to games folder" : "Copy failed (SD space?)"); SDL_Delay(1600);
+    toast(LauncherLocalization::Translate(
+      ok ? "Installed to games folder" : "Copy failed (SD space?)").data());
     if (ok) { ensureDefaultGameSource(); g_rescanAfterSettings = true; }
   }
 }
@@ -3479,30 +4571,30 @@ static void gameSourcesScreen() {
         else if(event.cbutton.button==BTN_CANCEL) return;
         else if(event.cbutton.button==BTN_CONFIRM){
           if(sel==0){
-            if(sources.size()>=16){ toast("Maximum of 16 game folders"); SDL_Delay(900); continue; }
+            if(sources.size()>=16){ toastStatic("Maximum of 16 game folders"); continue; }
             std::string selected=browseFolder({});
             if(!selected.empty()){
               std::string identity=pathIdentity(selected);
               if(std::any_of(sources.begin(),sources.end(),[&](const std::string &path){ return pathIdentity(path)==identity; })){
-                toast("Folder already added"); SDL_Delay(800);
+                toastStatic("Folder already added");
               } else { ensureSavedPathMountedAtStartup(selected); sources.push_back(selected); saveGameSources(sources); g_rescanAfterSettings=true; sel=(int)sources.size(); }
               rebuild=true;
             }
           } else {
             const char *actions[]={"Change folder","Move up","Move down","Remove"};
-            int action=dropdown("Game folder",actions,4,0); size_t index=(size_t)(sel-1);
+            int action=dropdownStaticTitle("Game folder",actions,4,0); size_t index=(size_t)(sel-1);
             if(action==0){
               std::string selected=browseFolder(sources[index]);
               if(!selected.empty()){
                 std::string identity=pathIdentity(selected); bool duplicate=false;
                 for(size_t i=0;i<sources.size();i++) if(i!=index&&pathIdentity(sources[i])==identity) duplicate=true;
-                if(duplicate){ toast("Folder already added"); SDL_Delay(800); }
+                if(duplicate){ toastStatic("Folder already added"); }
                 else { ensureSavedPathMountedAtStartup(selected); sources[index]=selected; saveGameSources(sources); g_rescanAfterSettings=true; }
                 rebuild=true;
               }
             } else if(action==1&&index>0){ std::swap(sources[index],sources[index-1]); saveGameSources(sources); sel--; g_rescanAfterSettings=true; rebuild=true; }
             else if(action==2&&index+1<sources.size()){ std::swap(sources[index],sources[index+1]); saveGameSources(sources); sel++; g_rescanAfterSettings=true; rebuild=true; }
-            else if(action==3&&confirmBox("Remove game folder?",{sources[index],"","No files will be deleted."})){
+            else if(action==3&&confirmBoxStatic("Remove game folder?",{sources[index],"","No files will be deleted."})){
               sources.erase(sources.begin()+index); saveGameSources(sources); sel=std::max(0,sel-1); g_rescanAfterSettings=true; rebuild=true;
             }
           }
@@ -3512,16 +4604,16 @@ static void gameSourcesScreen() {
       }
       if(rebuild) break;
       clearUiBackground();
-      drawText(g_font_big,64,34,"Game folders",COL_HI);
-      drawTextR(g_font_sm,SW-64,52,"All folders are scanned and passed to Cemu",COL_DIM);
+      drawStaticText(g_font_big,64,34,"Game folders",COL_HI);
+      drawStaticTextR(g_font_sm,SW-64,52,"All folders are scanned and passed to Cemu",COL_DIM);
       for(int row=0;row<vis&&top+row<n;row++){
         int index=top+row,y=112+row*50; bool current=index==sel;
         if(current){ fillRect(56,y-3,SW-112,46,COL_FOCUS); fillRect(56,y-3,5,46,COL_SEL); }
         std::string label=index==0?"[ Add game folder ]":sources[index-1];
         drawText(g_font,82,y,ellipsizedText(g_font,label,SW-170).c_str(),current?COL_VAL:(index==0?COL_HI:COL_TXT));
       }
-      drawSettingsFooter("A  Select       B  Back");
-      SDL_RenderPresent(g_ren); SDL_Delay(8);
+      drawLocalizedFooter("A  Select       B  Back");
+    SDL_RenderPresent(g_ren); waitForNextUiFrame();
     }
   }
 }
@@ -3606,12 +4698,13 @@ static bool installedContentScreen(uint64_t baseTitleFilter = 0) {
           snprintf(titleId, sizeof(titleId), "%016llX",
                    (unsigned long long)component.titleId);
           if (action == 0) {
-            modalMessage("Installed component", {
+            modalMessageStatic("Installed component", {
               component.name.empty() ? "Unnamed Wii U title" : component.name,
               std::string(installedKindName(component.kind)) + "  -  " + titleId,
               installedSizeText(component.sizeBytes),
               component.path,
-              component.metadataValid ? "Metadata verified" : "Metadata missing or does not match the title ID"
+              std::string(LauncherLocalization::Translate(component.metadataValid ?
+                "Metadata verified" : "Metadata missing or does not match the title ID"))
             });
             beginScreenFx();
           } else if (action == 1 && confirmBox(
@@ -3625,13 +4718,12 @@ static bool installedContentScreen(uint64_t baseTitleFilter = 0) {
               })) {
             std::string error;
             if (!cemu_removeInstalledComponent(mlcRoot, component.titleId, error)) {
-              modalMessage("Delete failed", {error, "Saved data was not touched."});
+              modalMessageStatic("Delete failed", {error, "Saved data was not touched."});
               beginScreenFx();
             } else {
               baseDeleted = baseDeleted || component.kind == CemuInstalledKind::Base;
               g_rescanAfterSettings = true;
-              toast("Installed component deleted");
-              SDL_Delay(900);
+              toastStatic("Installed component deleted");
               refresh = true;
             }
           }
@@ -3642,11 +4734,12 @@ static bool installedContentScreen(uint64_t baseTitleFilter = 0) {
       if (refresh) break;
 
       clearUiBackground();
-      drawHeader(baseTitleFilter ? "Installed game content" : "Installed content",
-                 "Base games, updates, and DLC");
+      drawHeader(LauncherLocalization::Translate(
+                   baseTitleFilter ? "Installed game content" : "Installed content").data(),
+                 LauncherLocalization::Translate("Base games, updates, and DLC").data());
       if (!count) {
-        drawTextC(g_font, SW / 2, SH / 2 - 20,
-                  baseTitleFilter ? "No installed content for this game" : "No installed content found",
+        drawTextC(g_font, SW / 2, SH / 2 - 20,LauncherLocalization::Translate(
+                  baseTitleFilter ? "No installed content for this game" : "No installed content found").data(),
                   COL_DIM);
       }
       for (int row = 0; row < visible && top + row < count; row++) {
@@ -3670,15 +4763,16 @@ static bool installedContentScreen(uint64_t baseTitleFilter = 0) {
         const std::string size = installedSizeText(component.sizeBytes);
         drawTextR(g_font_sm, SW - 74, y + 22, size.c_str(), current ? COL_VAL : COL_DIM);
       }
-      drawSettingsFooter(count ? "A  Details / delete       B  Back" : "B  Back");
-      drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+      drawLocalizedFooter(count ? "A  Details / delete       B  Back" : "B  Back");
+      drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
     }
   }
 }
 
+static void downloadAllCovers();
 static void libraryStorageScreen() {
   static int savedSelection=0;
-  constexpr int rowCount=5;
+  constexpr int rowCount=6;
   constexpr int rowHeight=64;
   constexpr int startY=126;
   int sel=std::max(0,std::min(savedSelection,rowCount-1));
@@ -3687,7 +4781,8 @@ static void libraryStorageScreen() {
     if(sel==0) gameSourcesScreen();
     else if(sel==1) runFileManager();
     else if(sel==2) networkSharesScreen();
-    else if(sel==3) installedContentScreen();
+    else if(sel==3) downloadAllCovers();
+    else if(sel==4) installedContentScreen();
     else doInstallFlow();
     installedCount = cemu_scanInstalledComponents(std::string(DATA_DIR) + "/mlc01").size();
     beginScreenFx();
@@ -3715,7 +4810,7 @@ static void libraryStorageScreen() {
     }
 
     clearUiBackground();
-    drawHeader("Library & storage",nullptr);
+    drawHeader(LauncherLocalization::Translate("Library & storage").data(),nullptr);
     int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
     glassPanel(colX-12,startY-10,colW+24,rowCount*rowHeight+18);
     float target=(float)(startY+sel*rowHeight+2);
@@ -3731,17 +4826,18 @@ static void libraryStorageScreen() {
     std::string smbValue=std::to_string(mounted)+" / "+std::to_string(shares.size())+" connected";
     std::string installedValue = std::to_string(installedCount) +
                                  (installedCount == 1 ? " component" : " components");
-    const char *labels[rowCount]={"Game folders","File manager","SMB network shares","Installed content","Install update / DLC / game"};
-    const char *values[rowCount]={folderValue.c_str(),"SD / USB / SMB",smbValue.c_str(),installedValue.c_str(),"select package or folder"};
+    const char *labels[rowCount]={"Game folders","File manager","SMB network shares","Download covers","Installed content","Install update / DLC / game"};
+    const char *values[rowCount]={folderValue.c_str(),"SD / USB / SMB",smbValue.c_str(),"missing only",installedValue.c_str(),"select package or folder"};
     int fontHeight=TTF_FontHeight(g_font),smallHeight=TTF_FontHeight(g_font_sm);
     for(int row=0;row<rowCount;row++){
       int slot=startY+row*rowHeight,y=slot+(rowHeight-fontHeight)/2;
       bool current=row==sel;
-      drawText(g_font,labelX,y,labels[row],current?COL_VAL:COL_TXT);
-      drawTextR(g_font_sm,valX,slot+(rowHeight-smallHeight)/2,values[row],current?COL_VAL:COL_DIM);
+      drawText(g_font,labelX,y,LauncherLocalization::Translate(labels[row]).data(),current?COL_VAL:COL_TXT);
+      drawTextR(g_font_sm,valX,slot+(rowHeight-smallHeight)/2,
+                LauncherLocalization::Translate(values[row]).data(),current?COL_VAL:COL_DIM);
     }
-    drawSettingsFooter("A  Open       B  Back");
-    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+    drawLocalizedFooter("A  Open       B  Back");
+    drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
 }
 
@@ -3854,7 +4950,7 @@ static void onlineSettingsScreen() {
   uint32_t persistentId = 0x80000001;
   int service = 0;
   if (!cemu_readAccountSelection(SETTINGS_XML, persistentId, service)) {
-    modalMessage("Online settings unavailable", {"settings.xml could not be read safely."});
+    modalMessageStatic("Online settings unavailable", {"settings.xml could not be read safely."});
     return;
   }
   auto accountIndex = [&]() {
@@ -3893,7 +4989,7 @@ static void onlineSettingsScreen() {
       else if (event.cbutton.button == BTN_CONFIRM) {
         if (sel == 0) {
           if (accounts.empty()) {
-            modalMessage("No imported accounts", {
+            modalMessageStatic("No imported accounts", {
               "Copy an existing Wii U account.dat into:",
               std::string(DATA_DIR) + "/mlc01/usr/save/system/act/<persistent-id>/"
             });
@@ -3906,30 +5002,30 @@ static void onlineSettingsScreen() {
               labels.push_back(account.label.empty() ? id : account.label + "  (" + id + ")");
             }
             for (const auto &label : labels) pointers.push_back(label.c_str());
-            const int choice = dropdown("Imported Wii U account", pointers.data(),
+            const int choice = dropdownStaticTitle("Imported Wii U account", pointers.data(),
                                         (int)pointers.size(), selectedAccount);
             if (choice >= 0) {
               persistentId = accounts[choice].persistentId;
               cemu_readAccountService(SETTINGS_XML, persistentId, service);
               if (!cemu_writeAccountSelection(SETTINGS_XML, persistentId, service))
-                modalMessage("Settings not saved", {"settings.xml could not be updated safely."});
+                modalMessageStatic("Settings not saved", {"settings.xml could not be updated safely."});
             }
           }
           beginScreenFx();
         } else if (selectedAccount < 0) {
-          modalMessage("Select an account first", {"Online services require an imported account.dat."});
+          modalMessageStatic("Select an account first", {"Online services require an imported account.dat."});
           beginScreenFx();
         } else {
-          const int choice = dropdown("Network service", serviceNames, 4, service);
+          const int choice = dropdownStaticTitle("Network service", serviceNames, 4, service);
           if (choice >= 0) {
             service = choice;
             if (!cemu_writeAccountSelection(SETTINGS_XML, persistentId, service)) {
-              modalMessage("Settings not saved", {"settings.xml could not be updated safely."});
+              modalMessageStatic("Settings not saved", {"settings.xml could not be updated safely."});
             } else if (service == 3) {
               struct stat st{};
               if (lstat((std::string(DATA_DIR) + "/network_services.xml").c_str(), &st) != 0 ||
                   !S_ISREG(st.st_mode) || S_ISLNK(st.st_mode))
-                modalMessage("Custom service needs configuration", {
+                modalMessageStatic("Custom service needs configuration", {
                   "Add network_services.xml to the Cemu directory.",
                   "The service remains offline until that file is present."
                 });
@@ -3941,13 +5037,13 @@ static void onlineSettingsScreen() {
     }
 
     clearUiBackground();
-    drawHeader("Online & accounts", "Offline / Nintendo / Pretendo / Custom");
+    drawHeaderStatic("Online & accounts", "Offline / Nintendo / Pretendo / Custom");
     const int panelX = 170, panelW = SW - 340, rowH = 64;
     glassPanel(panelX, 106, panelW, rowH * 2 + 16);
     const int focusY = 116 + sel * 68;
     fillRect(panelX + 10, focusY, panelW - 20, 58, COL_FOCUS);
     fillRect(panelX + 10, focusY, 5, 58, COL_SEL);
-    drawText(g_font, panelX + 34, 132, "Account", sel == 0 ? COL_VAL : COL_TXT);
+    drawStaticText(g_font, panelX + 34, 132, "Account", sel == 0 ? COL_VAL : COL_TXT);
     std::string accountValue = "None imported";
     if (selectedAccount >= 0) {
       char id[16]; snprintf(id, sizeof(id), "%08X", persistentId);
@@ -3959,7 +5055,7 @@ static void onlineSettingsScreen() {
     drawTextR(g_font_sm, panelX + panelW - 28, 137,
               ellipsizedText(g_font_sm, accountValue, panelW / 2).c_str(),
               sel == 0 ? COL_VAL : COL_DIM);
-    drawText(g_font, panelX + 34, 200, "Service", sel == 1 ? COL_VAL : COL_TXT);
+    drawStaticText(g_font, panelX + 34, 200, "Service", sel == 1 ? COL_VAL : COL_TXT);
     drawTextR(g_font_sm, panelX + panelW - 28, 205,
               selectedAccount >= 0 ? serviceNames[service] : "Select an account",
               sel == 1 ? COL_VAL : COL_DIM);
@@ -3975,7 +5071,7 @@ static void onlineSettingsScreen() {
     const bool customConfig = lstat(customConfigPath.c_str(), &customConfigStat) == 0 &&
                               S_ISREG(customConfigStat.st_mode) && !S_ISLNK(customConfigStat.st_mode);
     const int statusX = panelX + 28, statusY = 306, statusStep = 43;
-    drawText(g_font, statusX, statusY - 52, "Credential readiness", COL_HI);
+    drawStaticText(g_font, statusX, statusY - 52, "Credential readiness", COL_HI);
     const std::string statusLines[] = {
       std::string("Selected account.dat: ") + (selectedAccount >= 0 ? "Ready" : "Missing"),
       std::string("otp.bin (1024 bytes): ") + otp,
@@ -3989,10 +5085,10 @@ static void onlineSettingsScreen() {
       drawText(g_font_sm, statusX, statusY + i * statusStep, statusLines[i].c_str(),
                ready ? (SDL_Color){145, 220, 155, 255} : (SDL_Color){235, 145, 120, 255});
     }
-    drawTextC(g_font_sm, SW / 2, SH - 76,
+    drawStaticTextC(g_font_sm, SW / 2, SH - 76,
               "Selecting a service does not create credentials or guarantee server access.", COL_DIM);
-    drawSettingsFooter("A  Change       B  Back");
-    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+    drawLocalizedFooter("A  Change       B  Back");
+    drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
 }
 
@@ -4071,13 +5167,18 @@ static void runSettingsRoot(const char *ctx) {
           }
           beginScreenFx();
           break;
+        case SDL_CONTROLLER_BUTTON_X:
+          if(global&&sel==langRow&&resetOption(O_console_language)){
+            toast(LauncherLocalization::Translate("Setting reset to default").data());
+          }
+          break;
         case BTN_CANCEL: return;
       }
       if(sel<top) top=sel;
       if(sel>=top+vis) top=sel-vis+1;
     }
     clearUiBackground();
-    drawHeader(global ? "Settings" : "Game settings", global?nullptr:ctx);
+    drawHeader(LauncherLocalization::Translate(global ? "Settings" : "Game settings").data(), global?nullptr:ctx);
     int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
     if(global){
       auto drawVisibleSection=[&](int begin,int end){
@@ -4101,29 +5202,29 @@ static void runSettingsRoot(const char *ctx) {
     for(int row=0;row<vis&&top+row<n;row++){ int i=top+row,slot=rowY(i),y=slot+(rowH-fh0)/2; bool cur=i==sel;
       if(global && i==langRow){
         char lv[64]; optValue(O_console_language, lv, sizeof(lv));
-        drawText(g_font,labelX,y,"Console language",cur?COL_VAL:COL_TXT);
+        drawText(g_font,labelX,y,LauncherLocalization::Translate("Console language").data(),cur?COL_VAL:COL_TXT);
         drawTextR(g_font,valX,y,lv,cur?COL_VAL:COL_DIM);
       } else if(global && i==gfxRow){
-        drawText(g_font,labelX,y,"Graphics packs",cur?COL_VAL:COL_TXT);
-        drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,"browse / download",cur?COL_VAL:COL_DIM);
+        drawText(g_font,labelX,y,LauncherLocalization::Translate("Graphics packs").data(),cur?COL_VAL:COL_TXT);
+        drawStaticTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,"browse / download",cur?COL_VAL:COL_DIM);
       } else if(global && i==launcherRow){
         const char *theme=storeGet(g_global,"Wrapper/Theme","homebrew");
         const char *value=!strcmp(theme,"xmb")?"XMB (PS3)":(!strcmp(theme,"animated")?"Glow":
                           (!strcmp(theme,"classic")?"Classic":(!strcmp(theme,"oled")?"OLED black":"Bubbles")));
-        drawText(g_font,labelX,y,"Launcher",cur?COL_VAL:COL_TXT);
+        drawText(g_font,labelX,y,LauncherLocalization::Translate("Launcher").data(),cur?COL_VAL:COL_TXT);
         drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,value,cur?COL_VAL:COL_DIM);
       } else if(global && i==libraryRow){
-        drawText(g_font,labelX,y,"Library & storage",cur?COL_VAL:COL_TXT);
-        drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,"games / files / network",cur?COL_VAL:COL_DIM);
+        drawText(g_font,labelX,y,LauncherLocalization::Translate("Library & storage").data(),cur?COL_VAL:COL_TXT);
+        drawStaticTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,"games / files / network",cur?COL_VAL:COL_DIM);
       } else if(global && i==onlineRow){
-        drawText(g_font,labelX,y,"Online & accounts",cur?COL_VAL:COL_TXT);
-        drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,"Offline / Nintendo / Pretendo",cur?COL_VAL:COL_DIM);
+        drawText(g_font,labelX,y,LauncherLocalization::Translate("Online & accounts").data(),cur?COL_VAL:COL_TXT);
+        drawStaticTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,"Offline / Nintendo / Pretendo",cur?COL_VAL:COL_DIM);
       } else if(global && i==framegenRow){
-        drawText(g_font,labelX,y,"Frame Generation",cur?COL_VAL:COL_TXT);
-        drawTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,"LSFG 2x / Vulkan",cur?COL_VAL:COL_DIM);
+        drawText(g_font,labelX,y,LauncherLocalization::Translate("Frame Generation").data(),cur?COL_VAL:COL_TXT);
+        drawStaticTextR(g_font_sm,valX,slot+(rowH-TTF_FontHeight(g_font_sm))/2,"LSFG 2x / Vulkan",cur?COL_VAL:COL_DIM);
       } else {
-        drawText(g_font,labelX,y,g_screens[order[global?i-screenStart:i]].title,cur?COL_VAL:COL_TXT);
-        drawTextR(g_font,valX,y,">",cur?COL_VAL:COL_DIM);
+        drawText(g_font,labelX,y,LauncherLocalization::Translate(g_screens[order[global?i-screenStart:i]].title).data(),cur?COL_VAL:COL_TXT);
+        drawStaticTextR(g_font,valX,y,">",cur?COL_VAL:COL_DIM);
       }
     }
     if(n>vis){
@@ -4131,21 +5232,27 @@ static void runSettingsRoot(const char *ctx) {
       int trackH=vis*rowH+(spansSections?sectionGap:0),trackX=colX+colW+16;
       fillRect(trackX,y0,4,trackH,(SDL_Color){40,44,54,255});
       int thumbH=std::max(16,trackH*vis/n),denom=std::max(1,n-vis); fillRect(trackX,y0+(trackH-thumbH)*top/denom,4,thumbH,COL_SEL); }
-    drawSettingsFooter("A  Open       X  Info       B  Back");
+    drawLocalizedFooter(global&&sel==langRow?
+      "A  Open       Y  Reset       X  Info       B  Back":"A  Open       X  Info       B  Back");
     drawFadeIn();
     SDL_RenderPresent(g_ren);
-    SDL_Delay(8);
+    waitForNextUiFrame();
   }
 }
 
 static void toast(const char *msg) {
-  for (int f = 0; f < 2; f++) {
-    clearUiBackground();
-    int pw=std::min(820,SW-64),ph=120,px=(SW-pw)/2,py=(SH-ph)/2;
-    glassPanel(px,py,pw,ph); border(px,py,pw,ph,2,COL_HI);
-    drawTextC(g_font,SW/2,py+46,ellipsizedText(g_font,msg,pw-48).c_str(),COL_TXT);
-    SDL_RenderPresent(g_ren); SDL_Delay(10);
-  }
+  g_toastMessage=msg?msg:"";
+  g_toastUntil=SDL_GetTicks()+1800;
+  wakeUiFromWorker(0x544f4153);
+}
+
+static void drawToastOverlay() {
+  if(g_toastMessage.empty()) return;
+  const Uint32 now=SDL_GetTicks();
+  if(SDL_TICKS_PASSED(now,g_toastUntil)){ g_toastMessage.clear(); return; }
+  const int pw=std::min(820,SW-64),ph=120,px=(SW-pw)/2,py=(SH-ph)/2;
+  glassPanel(px,py,pw,ph); border(px,py,pw,ph,2,COL_HI);
+  drawTextC(g_font,SW/2,py+46,ellipsizedText(g_font,g_toastMessage,pw-48).c_str(),COL_TXT);
 }
 
 static std::vector<std::string> wrapDialogLines(const std::vector<std::string> &lines,
@@ -4200,8 +5307,8 @@ static void modalMessage(const char *title, const std::vector<std::string> &line
       drawTextC(g_font,SW/2,y,line.c_str(),COL_TXT);
       y+=lineHeight;
     }
-    drawSettingsFooter("A  Continue",py+ph-30);
-    SDL_RenderPresent(g_ren); SDL_Delay(8);
+    drawLocalizedFooter("A  Continue",py+ph-30);
+    SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
 }
 
@@ -4237,10 +5344,10 @@ static bool confirmBox(const char *title, const std::vector<std::string> &lines)
       y+=40;
     }
     fillRect(yesx,bby,bw,bh,(SDL_Color){150,50,50,255}); border(yesx,bby,bw,bh,2,(SDL_Color){215,95,95,255});
-    drawButtonHint(yesx+(bw-buttonHintWidth("A","Yes"))/2,bby+bh/2,"A","Yes");
+    drawStaticButtonHint(yesx+(bw-buttonHintWidth("A","Yes"))/2,bby+bh/2,"A","Yes");
     fillRect(nox,bby,bw,bh,(SDL_Color){48,54,64,255}); border(nox,bby,bw,bh,2,COL_DIM);
-    drawButtonHint(nox+(bw-buttonHintWidth("B","No"))/2,bby+bh/2,"B","No");
-    SDL_RenderPresent(g_ren); SDL_Delay(8);
+    drawStaticButtonHint(nox+(bw-buttonHintWidth("B","No"))/2,bby+bh/2,"B","No");
+    SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
 }
 
@@ -4314,7 +5421,7 @@ static void requestLauncherExitAfterUpdate() {
 
 static void runUpdateScreen() {
   if(!g_griddbReady){
-    modalMessage("Update check unavailable",{
+    modalMessageStatic("Update check unavailable",{
       "The launcher could not initialize its network connection.",
       "Check the connection and try again."
     });
@@ -4397,7 +5504,7 @@ static void runUpdateScreen() {
     fillRect(0,0,SW,SH,(SDL_Color){0,0,0,105});
     glassPanel(panelX,panelY,panelWidth,panelHeight);
     border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
-    drawTextC(g_font_big,SW/2,panelY+24,"Cemu Update",COL_SEL);
+    drawStaticTextC(g_font_big,SW/2,panelY+24,"Cemu Update",COL_SEL);
 
     std::string status;
     switch(snapshot.state){
@@ -4445,11 +5552,11 @@ static void runUpdateScreen() {
       if(snapshot.state==LauncherUpdateState::UpdateAvailable) controls="A  Download       B  Back       Up / Down  Scroll";
       else if(snapshot.state==LauncherUpdateState::Error||snapshot.state==LauncherUpdateState::Cancelled) controls="A  Retry       B  Back";
       else if(snapshot.state==LauncherUpdateState::Installed) controls="A  Exit Cemu";
-      drawSettingsFooter(controls,panelY+panelHeight-38);
+      drawLocalizedFooter(controls,panelY+panelHeight-38);
     }
     drawFadeIn();
     SDL_RenderPresent(g_ren);
-    SDL_Delay(8);
+    waitForNextUiFrame();
   }
 }
 
@@ -4473,7 +5580,7 @@ static void drawUpdateNotification() {
   border(x,y,width,height,2,COL_SEL);
   const std::string title="Cemu "+g_updateNoticeTag+" is available";
   drawText(g_font,x+22,y+16,ellipsizedText(g_font,title,width-44).c_str(),COL_VAL);
-  drawText(g_font_sm,x+22,y+54,"Open Settings > Launcher > Check for Updates",COL_TXT);
+  drawStaticText(g_font_sm,x+22,y+54,"Open Settings > Launcher > Check for Updates",COL_TXT);
 }
 
 static const char *gridDbErrorText(int result) {
@@ -4481,6 +5588,31 @@ static const char *gridDbErrorText(int result) {
   if(result==GRIDDB_NO_NET) return "Could not connect to SteamGridDB.";
   if(result==GRIDDB_NOT_FOUND) return "No matching artwork was found.";
   return "SteamGridDB returned an unexpected error.";
+}
+
+template <typename Work>
+static bool runCancellableNetworkTask(const char *title,const char *detail,Work work) {
+  std::atomic_bool cancel{false},complete{false};
+  std::thread worker([&]{ work(cancel); complete=true; wakeUiFromWorker(0x4e455457); });
+  while(!complete.load(std::memory_order_acquire)){
+    if(!beginUiFrame()){ cancel=true; break; }
+    SDL_Event event;
+    while(pollUiEvent(event)){
+      pumpStick(event);
+      int x=0,y=0;
+      if((event.type==SDL_CONTROLLERBUTTONDOWN&&event.cbutton.button==BTN_CANCEL)||
+         (touchFeed(event,&x,&y)==TOUCH_TAP&&y>=SH-90)) cancel=true;
+    }
+    clearUiBackground();
+    drawHeader(title,nullptr);
+    drawTextC(g_font,SW/2,SH/2-10,
+              cancel.load()?"Cancelling...":detail,COL_TXT);
+    drawLocalizedFooter("B  Cancel");
+    SDL_RenderPresent(g_ren); waitForNextUiFrame();
+  }
+  cancel = cancel.load() || !complete.load();
+  if(worker.joinable()) worker.join();
+  return !cancel.load();
 }
 
 static int chooseCoverArtwork(const std::vector<GridDbArtwork> &artworks,const char *gameName) {
@@ -4504,11 +5636,14 @@ static int chooseCoverArtwork(const std::vector<GridDbArtwork> &artworks,const c
     releasePreview();
     loaded=index; previewFailed=false;
     clearUiBackground();
-    drawHeader("Choose cover artwork",gameName);
-    drawTextC(g_font,previewX+previewAreaWidth/2,SH/2-18,"Loading preview...",COL_DIM);
+    drawHeaderStatic("Choose cover artwork",gameName);
+    drawStaticTextC(g_font,previewX+previewAreaWidth/2,SH/2-18,"Loading preview...",COL_DIM);
     SDL_RenderPresent(g_ren);
     const std::string &url=artworks[index].thumbnailUrl.empty()?artworks[index].url:artworks[index].thumbnailUrl;
-    if(griddb_download_image(url,temporary)==GRIDDB_OK)
+    int result=GRIDDB_CANCELLED;
+    runCancellableNetworkTask("Choose cover artwork","Loading preview...",
+      [&](const std::atomic_bool &cancel){ result=griddb_download_image(url,temporary,&cancel); });
+    if(result==GRIDDB_OK)
       preview=loadScaledTexture(temporary,previewWidth,previewHeight);
     previewFailed=preview==nullptr;
     remove(temporary.c_str());
@@ -4550,7 +5685,7 @@ static int chooseCoverArtwork(const std::vector<GridDbArtwork> &artworks,const c
     }
 
     clearUiBackground();
-    drawHeader("Choose cover artwork",gameName);
+    drawHeaderStatic("Choose cover artwork",gameName);
     glassPanel(listX-10,startY-10,listWidth+20,std::min(visible,(int)artworks.size())*rowHeight+18);
     for(int row=0;row<visible&&top+row<(int)artworks.size();row++){
       int index=top+row,y=startY+row*rowHeight,currentY=y+(rowHeight-TTF_FontHeight(g_font))/2;
@@ -4566,10 +5701,10 @@ static int chooseCoverArtwork(const std::vector<GridDbArtwork> &artworks,const c
     int imageX=previewX+(previewAreaWidth-previewWidth)/2,imageY=startY;
     fillRect(imageX,imageY,previewWidth,previewHeight,COL_CARD);
     if(loaded==sel&&preview){ SDL_Rect destination={imageX,imageY,previewWidth,previewHeight}; SDL_RenderCopy(g_ren,preview,nullptr,&destination); }
-    else if(loaded==sel&&previewFailed) drawTextC(g_font_sm,imageX+previewWidth/2,imageY+previewHeight/2,"Preview unavailable",COL_DIM);
+    else if(loaded==sel&&previewFailed) drawStaticTextC(g_font_sm,imageX+previewWidth/2,imageY+previewHeight/2,"Preview unavailable",COL_DIM);
     border(imageX,imageY,previewWidth,previewHeight,2,loaded==sel?COL_SEL:COL_DIM);
-    drawSettingsFooter("A  Use artwork       B  Back");
-    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+    drawLocalizedFooter("A  Use artwork       B  Back");
+    drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
 }
 
@@ -4577,22 +5712,24 @@ static void downloadCover(Game &g) {
   std::string key=steamGridDbKey();
   if (key.empty()) {
     if(promptAndSaveSteamGridDbKey("Enter your free SteamGridDB API key",false)) key=steamGridDbKey();
-    else { toast("A SteamGridDB API key is required"); SDL_Delay(1200); return; }
+    else { toastStatic("A SteamGridDB API key is required"); return; }
   }
   mkdir(COVERS_DIR, 0777);
   std::string query=g.title;
   GridDbGameResult selectedGame;
   for(;;){
-    toast("Searching SteamGridDB...");
+    toastStatic("Searching SteamGridDB...");
     std::vector<GridDbGameResult> matches;
-    int searchResult=griddb_search_games(key,query,matches);
+    int searchResult=GRIDDB_CANCELLED;
+    if(!runCancellableNetworkTask("Download cover","Searching SteamGridDB...",
+       [&](const std::atomic_bool &cancel){ searchResult=griddb_search_games(key,query,matches,&cancel); })) return;
     if(searchResult==GRIDDB_NO_KEY){
       if(!promptAndSaveSteamGridDbKey("SteamGridDB API key rejected",false)) return;
       key=steamGridDbKey();
       continue;
     }
     if(searchResult!=GRIDDB_OK&&searchResult!=GRIDDB_NOT_FOUND){
-      modalMessage("Cover search failed",{gridDbErrorText(searchResult)});
+      modalMessageStatic("Cover search failed",{std::string(gridDbErrorText(searchResult))});
       return;
     }
     std::vector<std::string> labels={"Custom search..."};
@@ -4600,11 +5737,11 @@ static void downloadCover(Game &g) {
     std::vector<const char*> names;
     names.reserve(labels.size());
     for(const auto &label:labels) names.push_back(label.c_str());
-    int gameIndex=dropdown("Choose matching title",names.data(),(int)names.size(),-1);
+    int gameIndex=dropdownStaticTitle("Choose matching title",names.data(),(int)names.size(),-1);
     if(gameIndex<0) return;
     if(gameIndex==0){
       char custom[256];
-      if(!promptText("Custom SteamGridDB search",query.c_str(),custom,sizeof(custom))) continue;
+      if(!promptTextStatic("Custom SteamGridDB search",query.c_str(),custom,sizeof(custom))) continue;
       std::string nextQuery=trim(custom);
       if(!nextQuery.empty()) query=std::move(nextQuery);
       continue;
@@ -4613,63 +5750,132 @@ static void downloadCover(Game &g) {
     break;
   }
 
-  toast("Loading available artwork...");
+  toastStatic("Loading available artwork...");
   std::vector<GridDbArtwork> artworks;
-  int result=griddb_fetch_artworks(key,selectedGame.id,artworks);
-  if(result!=GRIDDB_OK){ modalMessage("Artwork search failed",{gridDbErrorText(result)}); return; }
+  int result=GRIDDB_CANCELLED;
+  if(!runCancellableNetworkTask("Download cover","Loading available artwork...",
+     [&](const std::atomic_bool &cancel){ result=griddb_fetch_artworks(key,selectedGame.id,artworks,&cancel); })) return;
+  if(result!=GRIDDB_OK){ modalMessageStatic("Artwork search failed",{std::string(gridDbErrorText(result))}); return; }
   int artworkIndex=chooseCoverArtwork(artworks,selectedGame.name.c_str());
   if(artworkIndex<0) return;
 
-  toast("Downloading selected cover...");
-  result=griddb_download_image(artworks[artworkIndex].url,coverPath(g));
-  if(result==GRIDDB_OK){ reloadCover(g); toast("Cover downloaded"); }
-  else toast("Cover download failed");
-  SDL_Delay(1200);
+  toastStatic("Downloading selected cover...");
+  if(!runCancellableNetworkTask("Download cover","Downloading selected cover...",
+     [&](const std::atomic_bool &cancel){ result=griddb_download_image(artworks[artworkIndex].url,coverPath(g),&cancel); })) return;
+  if(result==GRIDDB_OK){ reloadCover(g); toastStatic("Cover downloaded"); }
+  else toastStatic("Cover download failed");
+}
+
+static void importCoverFromFile(Game &g){
+  const std::string selected=browseCoverImage(parentFolder(g.path));if(selected.empty())return;
+  mkdir(COVERS_DIR,0777);const std::string destination=coverPath(g),temporary=destination+".tmp";
+  bool imported=false;std::string reason,detail;
+  if(!runCancellableNetworkTask("Importing local cover",fileNameOf(selected).c_str(),[&](const std::atomic_bool &cancel){
+    const auto fail=[&](const char *message,const char *technical=nullptr){reason=message;if(technical)detail=technical;remove(temporary.c_str());};
+    struct stat info{};if(cancel.load())return;
+    if(stat(selected.c_str(),&info)!=0||!S_ISREG(info.st_mode)){fail("The selected cover file is unavailable.",strerror(errno));return;}
+    if(info.st_size<1||(uint64_t)info.st_size>32ull*1024*1024){fail("The selected cover file is too large.");return;}
+    if(!recoverAtomicFile(destination)){fail("Cemu could not prepare the cover file safely.",strerror(errno));return;}
+    using Surface=std::unique_ptr<SDL_Surface,decltype(&SDL_FreeSurface)>;Surface source{IMG_Load(selected.c_str()),SDL_FreeSurface};
+    if(!source){fail("The selected file is not a supported image.",IMG_GetError());return;}
+    if(source->w<=0||source->h<=0||source->w>8192||source->h>8192||(uint64_t)source->w*(uint64_t)source->h>16ull*1024*1024){fail("The selected image dimensions are too large.");return;}
+    if(cancel.load())return;
+    Surface converted{SDL_ConvertSurfaceFormat(source.get(),SDL_PIXELFORMAT_RGBA32,0),SDL_FreeSurface};source.reset();
+    if(!converted||IMG_SavePNG(converted.get(),temporary.c_str())!=0){fail("Cemu could not convert the selected image to PNG.",IMG_GetError());return;}
+    converted.reset();if(cancel.load()){remove(temporary.c_str());return;}Surface verify{IMG_Load(temporary.c_str()),SDL_FreeSurface};
+    if(!verify||verify->w<=0||verify->h<=0){fail("Cemu could not verify the converted cover.",IMG_GetError());return;}verify.reset();
+    FILE *saved=fopen(temporary.c_str(),"rb+");if(!saved){fail("Cemu could not save the converted cover.",strerror(errno));return;}
+    const bool synced=fsync(fileno(saved))==0,closed=fclose(saved)==0;if(!synced||!closed){fail("Cemu could not save the converted cover.",strerror(errno));return;}
+    if(cancel.load()){remove(temporary.c_str());return;}if(!replaceAtomic(destination,temporary)){fail("Cemu could not replace the current cover safely.",strerror(errno));return;}imported=true;
+  }))return;
+  if(imported){reloadCover(g);toastStatic("Cover imported");return;}
+  std::vector<std::string> lines{std::string(LauncherLocalization::Translate(reason.empty()?"The selected cover could not be imported safely.":reason))};if(!detail.empty())lines.push_back(detail);
+  modalMessage(LauncherLocalization::Translate("Cover import failed").data(),lines);
+}
+
+static void coverSettings(Game &g){
+  int selection=0;const int margin=SW>=1600?120:70,gap=SW>=1600?36:24,cardsY=116,cardsBottom=SH-82;
+  const int cardW=(SW-margin*2-gap)/2,cardH=cardsBottom-cardsY;const SDL_Rect cards[2]={{margin,cardsY,cardW,cardH},{margin+cardW+gap,cardsY,cardW,cardH}};
+  const char *titles[2]={"Download from SteamGridDB","Import cover from file"};const char *kinds[2]={"Online artwork","Local image"};
+  const char *descriptions[2]={"Search SteamGridDB and replace this game's custom cover with selected online artwork.","Choose a PNG, JPEG, WebP or BMP image from SD, USB or SMB storage. It is validated and saved safely as PNG."};
+  const auto inside=[](const SDL_Rect&r,int x,int y){return x>=r.x&&x<r.x+r.w&&y>=r.y&&y<r.y+r.h;};
+  const auto removeCustom=[&]{const std::string path=coverPath(g);if(!regularFileExists(path)||!confirmBoxStatic("Remove custom cover?",{"The downloaded or imported cover will be deleted.","The launcher will use the game's embedded artwork when available."}))return;
+    if(remove(path.c_str())!=0&&errno!=ENOENT)modalMessageStatic("Cover removal failed",{std::string(strerror(errno))});else{fsdevCommitDevice("sdmc");reloadCover(g);toastStatic("Custom cover removed");}};
+  beginScreenFx();for(;;){
+    if(!beginUiFrame())return;
+    const bool hasCustom=regularFileExists(coverPath(g));SDL_Event event;navRepeat();
+    while(pollUiEvent(event)){pumpStick(event);int tx=0,ty=0;TouchKind touch=touchFeed(event,&tx,&ty);bool choose=false;
+      if(touch==TOUCH_TAP){if(inside(cards[0],tx,ty)){selection=0;choose=true;}else if(inside(cards[1],tx,ty)){selection=1;choose=true;}else if(ty>=SH-48)return;}
+      if(event.type==SDL_CONTROLLERBUTTONDOWN){if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_LEFT)selection=0;else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_RIGHT)selection=1;
+        else if(event.cbutton.button==BTN_CONFIRM)choose=true;else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_X&&hasCustom){removeCustom();beginScreenFx();}else if(event.cbutton.button==BTN_CANCEL)return;}
+      if(choose){if(selection==0)downloadCover(g);else importCoverFromFile(g);beginScreenFx();}}
+    clearUiBackground();drawHeaderStatic("Cover settings",g.title.c_str());for(int index=0;index<2;index++){const SDL_Rect&card=cards[index];const bool current=index==selection;
+      fillRect(card.x+5,card.y+7,card.w,card.h,(SDL_Color){0,0,0,62});fillRect(card.x,card.y,card.w,card.h,current?COL_FOCUS:COL_CARD);border(card.x,card.y,card.w,card.h,current?4:2,current?COL_SEL:COL_DIM);if(current)fillRect(card.x,card.y,8,card.h,COL_SEL);
+      const std::string title(LauncherLocalization::Translate(titles[index]));drawTextC(g_font_big,card.x+card.w/2,card.y+52,ellipsizedText(g_font_big,title,card.w-70).c_str(),current?COL_VAL:COL_TXT);
+      drawTextC(g_font,card.x+card.w/2,card.y+142,LauncherLocalization::Translate(kinds[index]).data(),current?COL_HI:COL_DIM);drawWrapped(g_font_sm,card.x+44,card.y+214,card.w-88,TTF_FontHeight(g_font_sm)+8,5,LauncherLocalization::Translate(descriptions[index]).data(),current?COL_TXT:COL_DIM);}
+    drawLocalizedFooter(hasCustom?"A  Choose       Y  Remove custom cover       B  Back":"A  Choose       B  Back");drawFadeIn();SDL_RenderPresent(g_ren);waitForNextUiFrame();}
 }
 
 static void downloadAllCovers() {
   std::string key=steamGridDbKey();
   if (key.empty()) {
     if(promptAndSaveSteamGridDbKey("Enter your free SteamGridDB API key",false)) key=steamGridDbKey();
-    else { toast("A SteamGridDB API key is required"); SDL_Delay(1200); return; }
+    else { toastStatic("A SteamGridDB API key is required"); return; }
   }
   mkdir(COVERS_DIR, 0777);
   std::vector<int> pending;
   for (int i=0;i<(int)g_games.size();i++) if(!regularFileExists(existingCoverPath(g_games[i]))) pending.push_back(i);
-  if (pending.empty()) { toast("All covers already downloaded"); SDL_Delay(1200); return; }
-  int total=(int)pending.size(), done=0, ok=0, fail=0; bool cancel=false;
-  for (int k=0;k<total && !cancel;k++){
-    if (!beginUiFrame()) return;
-    Game &g = g_games[pending[k]];
-    SDL_Event e; while(pollUiEvent(e)){ pumpStick(e);
-      if(e.type==SDL_CONTROLLERBUTTONDOWN && e.cbutton.button==BTN_CANCEL) cancel=true;
-      { int tx=0,ty=0; if(touchFeed(e,&tx,&ty)==TOUCH_TAP && ty>=SH-90) cancel=true; }
+  if (pending.empty()) { toastStatic("All covers already downloaded"); return; }
+  struct CoverJob { std::string key,title,path; };
+  std::vector<CoverJob> jobs; jobs.reserve(pending.size());
+  for(int index:pending) jobs.push_back({g_games[index].key,g_games[index].title,coverPath(g_games[index])});
+  std::vector<std::string> successfulKeys;
+  const int total=(int)jobs.size();
+  std::atomic<int> done{0},ok{0},fail{0},current{0},lastResult{GRIDDB_OK};
+  std::atomic<bool> cancel{false},complete{false};
+  std::thread worker([&]{
+    for(int index=0;index<total&&!cancel.load();index++){
+      current=index;
+      const int result=griddb_fetch_cover(key,jobs[index].title,jobs[index].path,&cancel);
+      lastResult=result;
+      if(result==GRIDDB_OK){ ok++; successfulKeys.push_back(jobs[index].key); } else if(result!=GRIDDB_CANCELLED) fail++;
+      done++;
+      wakeUiFromWorker(0x434f5645);
+      if(result==GRIDDB_NO_KEY) break;
     }
-    if(cancel) break;
+    complete=true; wakeUiFromWorker(0x434f5645);
+  });
+  while(!complete.load()){
+    if(!beginUiFrame()){ cancel=true; break; }
+    SDL_Event e; while(pollUiEvent(e)){ pumpStick(e);
+      if(e.type==SDL_CONTROLLERBUTTONDOWN&&e.cbutton.button==BTN_CANCEL) cancel=true;
+      int tx=0,ty=0; if(touchFeed(e,&tx,&ty)==TOUCH_TAP&&ty>=SH-90) cancel=true;
+    }
     clearUiBackground();
-    drawHeader("Download all covers", nullptr);
-    drawTextC(g_font, SW/2, SH/2-96, ("Downloading  "+std::to_string(done+1)+" / "+std::to_string(total)).c_str(), COL_VAL);
-    drawTitleCell(SW/2, SW-260, SH/2-44, g.title, true, COL_TXT);
+    drawHeaderStatic("Download covers", nullptr);
+    const int active=std::min(current.load(),total-1);
+    drawTextC(g_font, SW/2, SH/2-96, ("Downloading  "+std::to_string(std::min(done.load()+1,total))+" / "+std::to_string(total)).c_str(), COL_VAL);
+    drawTitleCell(SW/2, SW-260, SH/2-44, jobs[active].title, true, COL_TXT);
     int bw=SW-360, bx=180, by=SH/2+16, bh=26;
     fillRect(bx,by,bw,bh,(SDL_Color){40,44,54,255}); border(bx,by,bw,bh,2,COL_DIM);
-    fillRect(bx,by, total?bw*done/total:0, bh, COL_SEL);
-    char st[64]; snprintf(st,sizeof(st),"%d downloaded    %d failed",ok,fail);
+    fillRect(bx,by,total?bw*done.load()/total:0,bh,COL_SEL);
+    char st[64]; snprintf(st,sizeof(st),"%d downloaded    %d failed",ok.load(),fail.load());
     drawTextC(g_font_sm, SW/2, by+46, st, COL_DIM);
-    drawSettingsFooter("B  Cancel");
-    SDL_RenderPresent(g_ren);
-    int rc=GRIDDB_NO_KEY;
-    for(;;){
-      rc=griddb_fetch_cover(key,g.title,coverPath(g));
-      if(rc!=GRIDDB_NO_KEY) break;
-      if(!promptAndSaveSteamGridDbKey("SteamGridDB API key rejected",false)){ cancel=true; break; }
-      key=steamGridDbKey();
-    }
-    if(cancel) break;
-    if(rc==GRIDDB_OK){ ok++; reloadCover(g); } else fail++;
-    done++;
+    drawLocalizedFooter("B  Cancel");
+    SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
-  char msg[96]; snprintf(msg,sizeof(msg),"Covers: %d downloaded, %d failed%s",ok,fail,cancel?" (cancelled)":"");
-  toast(msg); SDL_Delay(1600);
+  const bool wasCancelled=cancel.load();
+  cancel=true;
+  if(worker.joinable()) worker.join();
+  const std::unordered_set<std::string> downloaded(successfulKeys.begin(),successfulKeys.end());
+  for(Game &game:g_games) if(downloaded.count(game.key)){
+    if(game.cover){ SDL_DestroyTexture(game.cover); game.cover=nullptr; }
+    game.triedCover=false;
+  }
+  if(lastResult.load()==GRIDDB_NO_KEY)
+    modalMessageStatic("SteamGridDB API key rejected",{"Update the saved API key in Launcher settings."});
+  char msg[96]; snprintf(msg,sizeof(msg),"Covers: %d downloaded, %d failed%s",ok.load(),fail.load(),wasCancelled?" (cancelled)":"");
+  toast(msg);
 }
 
 static bool writeEnabledPacks(const std::vector<CemuGraphicPack> &enabled) {
@@ -4753,13 +5959,12 @@ static std::string gfxCatDefault(const GfxPack &p, const GfxCat &c) {
 }
 
 static int downloadLatestGraphicPacks() {
-  toast("Downloading latest graphic packs...");
+  toastStatic("Downloading latest graphic packs...");
   appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
   const int result=gfxpacks_downloadLatest(GRAPHICPACKS_DIR);
   appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
   toast(result==GFX_OK?"Packs updated":result==GFX_UPTODATE?"Already up to date":
         result==GFX_NET_FAIL?"Download failed (network)":"Extract failed");
-  SDL_Delay(1300);
   return result;
 }
 
@@ -4839,10 +6044,12 @@ static void openPackPanel(const GfxPack &p, PackSel &s) {
     SDL_Color grey = {92, 98, 110, 255};
     for (int r = 0; r < vis && top + r < nrows; r++) {
       int i = top + r, y = LIST_Y0 + r * ROW_H + (ROW_H - fh0) / 2; bool cur = (i == row);
-      if (i == 0) { drawText(g_font, labelX, y, "Enabled", cur ? COL_VAL : COL_TXT);
-        SDL_Color oc = s.enabled ? (SDL_Color){120, 220, 120, 255} : COL_DIM; drawTextR(g_font, valX, y, s.enabled ? "On" : "Off", oc); }
+      if (i == 0) { drawStaticText(g_font, labelX, y, "Enabled", cur ? COL_VAL : COL_TXT);
+        SDL_Color oc = s.enabled ? (SDL_Color){120, 220, 120, 255} : COL_DIM;
+        drawTextR(g_font,valX,y,LauncherLocalization::Translate(s.enabled ? "On" : "Off").data(),oc); }
       else { const GfxCat &c = cats[i - 1]; bool en = s.enabled;
-        drawText(g_font, labelX, y, c.category.empty() ? "Options" : c.category.c_str(), en ? (cur ? COL_VAL : COL_TXT) : grey);
+        drawText(g_font,labelX,y,c.category.empty()?LauncherLocalization::Translate("Options").data():c.category.c_str(),
+                 en ? (cur ? COL_VAL : COL_TXT) : grey);
         drawScrollTextR(g_font, valX, y, colW / 2 - 24, choiceRef(c.category).c_str(), en ? (cur ? COL_VAL : COL_DIM) : grey); }
     }
     if (nrows > vis) { int trH = vis * ROW_H, trX = colX + colW + 16, trY = LIST_Y0 - 2; fillRect(trX, trY, 4, trH, (SDL_Color){40, 44, 54, 255});
@@ -4851,8 +6058,8 @@ static void openPackPanel(const GfxPack &p, PackSel &s) {
       int fy = SH - footerH + 6; fillRect(colX, fy - 12, colW, 2, (SDL_Color){40, 44, 54, 255});
       drawWrapped(g_font_sm, colX + 6, fy, colW - 12, TTF_FontHeight(g_font_sm) + 4, 3, p.description.c_str(), COL_DIM);
     }
-    drawSettingsFooter("A  Change       X  Info       B  Back");
-    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+    drawLocalizedFooter("A  Change       X  Info       B  Back");
+    drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
 }
 
@@ -4940,7 +6147,7 @@ static void gfxPackScreen(uint64_t filterTitleId) {
           if (mode == 1) { int g = 0; while (sel >= 0 && sel < nrows && rows[sel].header && g++ < nrows) sel = (sel + dir + nrows) % nrows; } }
       } else if (b == BTN_CANCEL) {
         if (mode == 1 && !perGame) { mode = 0; sel = gameSel; top = 0; beginScreenFx(); }
-        else { if (!commit()) { toast("Could not save graphics packs"); SDL_Delay(1600); } return; }
+        else { if (!commit()) { toastStatic("Could not save graphics packs"); } return; }
       } else if (b == BTN_CONFIRM) {
         if (mode == 0) {
           if (sel == 0) {
@@ -4984,7 +6191,7 @@ static void gfxPackScreen(uint64_t filterTitleId) {
     vis = (mode == 1) ? packVis() : listVis();
     clearUiBackground();
     std::string gname; if (mode == 1 && !perGame) { for (auto &gr : rows) if (!gr.header) { gname = gfxGameOf(packs[gr.packIndex]); break; } }
-    drawHeader("Graphics Packs", gname.empty() ? nullptr : gname.c_str());
+    drawHeaderStatic("Graphics Packs", gname.empty() ? nullptr : gname.c_str());
     int colX, colW, labelX, valX; listCol(&colX, &colW, &labelX, &valX);
     int fh0 = TTF_FontHeight(g_font);
     float ty = (float)(LIST_Y0 + (sel - top) * ROW_H + rowGap(sel) + 1);
@@ -4994,8 +6201,8 @@ static void gfxPackScreen(uint64_t filterTitleId) {
     for (int r = 0; r < vis && top + r < nrows; r++) {
       int i = top + r, y = LIST_Y0 + r * ROW_H + rowGap(i) + (ROW_H - fh0) / 2; bool cur = (i == sel);
       if (mode == 0) {
-        if (i == 0) drawText(g_font, labelX, y, "Download latest packs", cur ? COL_VAL : COL_HI);
-        else { drawText(g_font, labelX, y, games[i - 1].c_str(), cur ? COL_VAL : COL_TXT); drawTextR(g_font, valX, y, ">", cur ? COL_VAL : COL_DIM); }
+        if (i == 0) drawStaticText(g_font, labelX, y, "Download latest packs", cur ? COL_VAL : COL_HI);
+        else { drawText(g_font, labelX, y, games[i - 1].c_str(), cur ? COL_VAL : COL_TXT); drawStaticTextR(g_font, valX, y, ">", cur ? COL_VAL : COL_DIM); }
       } else {
         const GRow &gr = rows[i];
         if (gr.header) { drawText(g_font, colX + 14, y, gr.label.c_str(), COL_HI); }
@@ -5011,11 +6218,11 @@ static void gfxPackScreen(uint64_t filterTitleId) {
         drawWrapped(g_font_sm, colX + 6, fy, colW - 12, TTF_FontHeight(g_font_sm) + 4, 4, p.description.c_str(), COL_DIM); }
     }
     if ((mode == 0 && games.empty()) || (mode == 1 && rows.empty()))
-      drawTextC(g_font_sm, SW / 2, LIST_Y0 + ROW_H * 3, "No packs - use Download latest packs", COL_DIM);
+      drawStaticTextC(g_font_sm, SW / 2, LIST_Y0 + ROW_H * 3, "No packs - use Download latest packs", COL_DIM);
     if (nrows > vis) { int trH = vis * ROW_H, trX = colX + colW + 16, trY = LIST_Y0 - 2; fillRect(trX, trY, 4, trH, (SDL_Color){40, 44, 54, 255});
       int thH = trH * vis / nrows, dn = (nrows - vis > 0 ? nrows - vis : 1); fillRect(trX, trY + (trH - thH) * top / dn, 4, thH, COL_SEL); }
-    drawSettingsFooter(mode==0?"A  Open       X  Info       B  Back":"A  Change       X  Info       B  Back");
-    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+    drawLocalizedFooter(mode==0?"A  Open       X  Info       B  Back":"A  Change       X  Info       B  Back");
+    drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
 }
 
@@ -5047,13 +6254,15 @@ static bool pickIcon(Game &g, char *outPath, size_t outSize) {
   std::string key=steamGridDbKey();
   if(!key.empty()){
     clearUiBackground();
-    drawHeader("Choose an icon", g.title.c_str());
-    drawTextC(g_font, SW/2, SH/2, "Fetching icons from SteamGridDB...", COL_TXT);
+    drawHeaderStatic("Choose an icon", g.title.c_str());
+    drawStaticTextC(g_font, SW/2, SH/2, "Fetching icons from SteamGridDB...", COL_TXT);
     SDL_RenderPresent(g_ren);
-    int nf=griddb_fetch_icons(key,g.title,tmp,14);
+    int nf=0;
+    if(!runCancellableNetworkTask("Choose an icon","Fetching icons from SteamGridDB...",
+       [&](const std::atomic_bool &cancel){ nf=griddb_fetch_icons(key,g.title,tmp,14,&cancel); })) return false;
     for(int i=0;i<nf;i++){ char p[300]; snprintf(p,sizeof(p),"%s/gicon_%d.png",tmp.c_str(),i); paths.push_back(p); }
   }
-  if(paths.empty()){ toast("No icon found - add a SteamGridDB key or download a cover first"); SDL_Delay(1800); return false; }
+  if(paths.empty()){ toastStatic("No icon found - add a SteamGridDB key or download a cover first"); return false; }
   int n=(int)paths.size();
   int cols=n<5?n:5; if(cols<1)cols=1;
   int rows=(n+cols-1)/cols, gap=18, top=150, bot=80;
@@ -5087,15 +6296,15 @@ static bool pickIcon(Game &g, char *outPath, size_t outSize) {
       }
     }
     clearUiBackground();
-    drawHeader("Choose an icon", g.title.c_str());
+    drawHeaderStatic("Choose an icon", g.title.c_str());
     for(int i=0;i<n;i++){ int r=i/cols,c=i%cols, x=x0+c*(cell+gap), y=y0+r*(cell+gap);
       if(i==sel) fillRect(x-6,y-6,cell+12,cell+12,COL_SEL);
       fillRect(x,y,cell,cell,COL_CARD);
       if(tex[i]){ SDL_Rect d{x,y,cell,cell}; SDL_RenderCopy(g_ren,tex[i],nullptr,&d); }
-      else drawTextC(g_font_sm,x+cell/2,y+cell/2,"?",COL_DIM);
+      else drawStaticTextC(g_font_sm,x+cell/2,y+cell/2,"?",COL_DIM);
     }
-    drawSettingsFooter("A  Choose       B  Back");
-    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+    drawLocalizedFooter("A  Choose       B  Back");
+    drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
   for(auto t:tex) if(t) SDL_DestroyTexture(t);
   if(chosen>=0 && chosen<n){ snprintf(outPath,outSize,"%s",paths[chosen].c_str()); return true; }
@@ -5105,9 +6314,8 @@ static bool pickIcon(Game &g, char *outPath, size_t outSize) {
 static void forwarderWizard(Game &g) {
   const int ix=110, iy=176, isz=280;
   const int rx=ix+isz+70; int rw=SW-rx-90;
-  const int nameY=196, authY=290, createY=406, fieldH=64, createH=58;
+  const int nameY=220, createY=340, fieldH=64, createH=58;
   char name[256]; snprintf(name,sizeof(name),"%s",g.title.c_str());
-  char author[128]; snprintf(author,sizeof(author),"%s","naga");
   char icon[300]={0};
   { struct stat st; std::string cp=existingCoverPath(g);
     if(stat(cp.c_str(),&st)==0) snprintf(icon,sizeof(icon),"%s",cp.c_str());
@@ -5124,22 +6332,21 @@ static void forwarderWizard(Game &g) {
     }
   };
   auto build=[&](){
-    if(!icon[0]){ toast("Pick an icon first"); SDL_Delay(1200); return; }
+    if(!icon[0]){ toastStatic("Pick an icon first"); return; }
     clearUiBackground();
-    drawHeader("Creating HOME shortcut", g.title.c_str());
-    drawTextC(g_font, SW/2, SH/2, "Building + installing forwarder...", COL_TXT);
+    drawHeaderStatic("Creating HOME shortcut", g.title.c_str());
+    drawStaticTextC(g_font, SW/2, SH/2, "Building + installing forwarder...", COL_TXT);
     SDL_RenderPresent(g_ren);
     appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
-    char err[256]={0}; bool ok=forwarder_create(g.key,name,author,icon,err,sizeof(err));
+    char err[256]={0}; bool ok=forwarder_create(g.key,g.legacyKey,name,icon,err,sizeof(err));
     appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
-    if(ok){ toast("HOME shortcut installed"); SDL_Delay(1800); done=true; }
-    else modalMessage("Shortcut failed", { err[0]?err:"Unknown error" });
+    if(ok){ toastStatic("HOME shortcut installed"); done=true; }
+    else modalMessageStatic("Shortcut failed", { std::string(err[0]?err:"Unknown error") });
     beginScreenFx();
   };
   auto activate=[&](){
     if(sel==0){ char p[300]; if(pickIcon(g,p,sizeof(p))){ snprintf(icon,sizeof(icon),"%s",p); if(iconTex)SDL_DestroyTexture(iconTex); iconTex=loadScaledTexture(icon,isz,isz); } beginScreenFx(); }
     else if(sel==1) edit("Shortcut name", name, sizeof(name));
-    else if(sel==2) edit("Author", author, sizeof(author));
     else build();
   };
 
@@ -5152,8 +6359,7 @@ static void forwarderWizard(Game &g) {
         if(tk==TOUCH_TAP){
           if(tx>=ix&&tx<ix+isz&&ty>=iy&&ty<iy+isz){ sel=0; activate(); }
           else if(ty>=nameY-6&&ty<nameY+fieldH){ sel=1; activate(); }
-          else if(ty>=authY-6&&ty<authY+fieldH){ sel=2; activate(); }
-          else if(ty>=createY-6&&ty<createY+createH){ sel=3; activate(); }
+          else if(ty>=createY-6&&ty<createY+createH){ sel=2; activate(); }
           else if(ty>=SH-40) done=true;
           continue;
         }
@@ -5162,31 +6368,30 @@ static void forwarderWizard(Game &g) {
       switch(e.cbutton.button){
         case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  sel=0; break;
         case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: if(sel==0) sel=1; break;
-        case SDL_CONTROLLER_BUTTON_DPAD_UP:    sel=(sel==0)?3:(sel==1?3:sel-1); break;
-        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  sel=(sel==0)?1:(sel==3?1:sel+1); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_UP:    sel=(sel==0)?2:sel-1; break;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  sel=(sel==0)?1:(sel==2?0:2); break;
         case BTN_CONFIRM: activate(); break;
         case BTN_CANCEL:  done=true; break;
       }
     }
     clearUiBackground();
-    drawHeader("Create HOME shortcut", g.title.c_str());
+    drawHeaderStatic("Create HOME shortcut", g.title.c_str());
     if(sel==0) fillRect(ix-6,iy-6,isz+12,isz+12,COL_SEL);
     fillRect(ix,iy,isz,isz,COL_CARD);
     if(iconTex){ SDL_Rect d{ix,iy,isz,isz}; SDL_RenderCopy(g_ren,iconTex,nullptr,&d); }
-    else drawTextC(g_font_sm,ix+isz/2,iy+isz/2,"(no icon)",COL_DIM);
-    drawTextC(g_font_sm, ix+isz/2, iy+isz+20, "Icon", sel==0?COL_VAL:COL_DIM);
+    else drawStaticTextC(g_font_sm,ix+isz/2,iy+isz/2,"(no icon)",COL_DIM);
+    drawStaticTextC(g_font_sm, ix+isz/2, iy+isz+20, "Icon", sel==0?COL_VAL:COL_DIM);
     auto field=[&](int idx,int y,const char*label,const char*val){ bool cur=sel==idx;
       if(cur){ fillRect(rx-10,y-6,rw+20,fieldH,COL_FOCUS); fillRect(rx-10,y-6,5,fieldH,COL_SEL); }
       drawText(g_font_sm, rx, y, label, cur?COL_VAL:COL_DIM);
       drawScrollTextL(g_font, rx, y+26, rw-8, val, cur?COL_VAL:COL_TXT); };
     field(1,nameY,"Name",name);
-    field(2,authY,"Author",author);
-    { bool cur=sel==3;
+    { bool cur=sel==2;
       fillRect(rx-10,createY-6,rw+20,createH, cur?(SDL_Color){44,86,44,240}:(SDL_Color){30,46,32,200});
       if(cur) fillRect(rx-10,createY-6,5,createH,COL_SEL);
-      drawTextC(g_font, rx+rw/2, createY+12, "Create shortcut", cur?COL_VAL:(SDL_Color){150,225,150,255}); }
-    drawSettingsFooter("A  Edit / choose       B  Back");
-    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+      drawStaticTextC(g_font, rx+rw/2, createY+12, "Create shortcut", cur?COL_VAL:(SDL_Color){150,225,150,255}); }
+    drawLocalizedFooter("A  Edit / choose       B  Back");
+    drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
   }
   if(iconTex) SDL_DestroyTexture(iconTex);
 }
@@ -5230,11 +6435,10 @@ static void clearShaderCaches(const Game &g) {
     }
   }
   if (paths.empty()) {
-    toast("No shader caches found");
-    SDL_Delay(900);
+    toastStatic("No shader caches found");
     return;
   }
-  if (!confirmBox("Clear shader caches?", {
+  if (!confirmBoxStatic("Clear shader caches?", {
         g.title, "", "Cemu will rebuild them the next time the game runs."
       }))
     return;
@@ -5244,18 +6448,136 @@ static void clearShaderCaches(const Game &g) {
     if (remove(path.c_str()) != 0 && errno != ENOENT)
       failed++;
   if (failed) {
-    modalMessage("Cache cleanup failed", {
+    modalMessageStatic("Cache cleanup failed", {
       std::to_string(failed) + " cache file(s) could not be removed."
     });
   } else {
-    toast("Shader caches cleared");
-    SDL_Delay(900);
+    toastStatic("Shader caches cleared");
   }
 }
 
+static int chooseLibraryAction(const char *title,const std::vector<std::string> &items) {
+  if(items.empty()) return -1;
+  int selection=0,top=0;
+  beginScreenFx();
+  for(;;){
+    if(!beginUiFrame()) return -1;
+    const int visible=std::max(1,std::min((int)items.size(),(SH-LIST_Y0-80)/ROW_H));
+    SDL_Event event{}; navRepeat();
+    while(pollUiEvent(event)){
+      pumpStick(event);
+      int tx=0,ty=0; const TouchKind touch=touchFeed(event,&tx,&ty);
+      if(touchScrollList(touch,selection,top,(int)items.size(),visible)) continue;
+      if(touch==TOUCH_TAP){
+        if(ty>=SH-44) return -1;
+        for(int row=0;row<visible&&top+row<(int)items.size();row++)
+          if(ty>=LIST_Y0+row*ROW_H&&ty<LIST_Y0+(row+1)*ROW_H){ selection=top+row; return selection; }
+      }
+      if(event.type!=SDL_CONTROLLERBUTTONDOWN) continue;
+      if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_UP) selection=(selection+(int)items.size()-1)%items.size();
+      else if(event.cbutton.button==SDL_CONTROLLER_BUTTON_DPAD_DOWN) selection=(selection+1)%items.size();
+      else if(event.cbutton.button==BTN_CONFIRM) return selection;
+      else if(event.cbutton.button==BTN_CANCEL) return -1;
+      if(selection<top) top=selection;
+      if(selection>=top+visible) top=selection-visible+1;
+    }
+    clearUiBackground(); drawHeader(title,nullptr);
+    int colX,colW,labelX,valX; listCol(&colX,&colW,&labelX,&valX);
+    glassPanel(colX-12,LIST_Y0-10,colW+24,visible*ROW_H+18);
+    for(int row=0;row<visible&&top+row<(int)items.size();row++){
+      const int index=top+row,y=LIST_Y0+row*ROW_H;
+      if(index==selection){ fillRect(colX,y,colW,ROW_H-2,COL_FOCUS); fillRect(colX,y,5,ROW_H-2,COL_SEL); }
+      drawText(g_font,labelX,y+(ROW_H-TTF_FontHeight(g_font))/2,items[index].c_str(),index==selection?COL_VAL:COL_TXT);
+    }
+    drawLocalizedFooter("A  Choose       B  Back");
+    drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
+  }
+}
+
+static void manageCollections() {
+  for(;;){
+    std::vector<std::string> choices{std::string(LauncherLocalization::Translate("New collection..."))};
+    for(const Collection &collection:g_collections) choices.push_back(collection.name);
+    const int selected=chooseLibraryAction("Manage collections",choices);
+    if(selected<0) return;
+    if(selected==0){
+      char name[96]{};
+      if(promptTextStatic("Collection name","",name,sizeof(name))&&trim(name).size()){
+        const std::string entered=trim(name);
+        const bool duplicate=std::any_of(g_collections.begin(),g_collections.end(),[&](const Collection &c){return !strcasecmp(c.name.c_str(),entered.c_str());});
+        if(duplicate) modalMessageStatic("Collection already exists",{entered});
+        else { g_collections.push_back({entered,{}}); saveLibraryOrganization(); }
+      }
+      beginScreenFx(); continue;
+    }
+    const int index=selected-1;
+    const int action=chooseLibraryAction(g_collections[index].name.c_str(),{
+      std::string(LauncherLocalization::Translate("Rename")),
+      std::string(LauncherLocalization::Translate("Delete collection"))});
+    if(action==0){
+      char renamed[96]{};
+      if(promptTextStatic("Rename collection",g_collections[index].name.c_str(),renamed,sizeof(renamed))&&trim(renamed).size()){
+        if(g_activeCollection==g_collections[index].name) g_activeCollection=trim(renamed);
+        g_collections[index].name=trim(renamed); saveLibraryOrganization(); rebuildLibraryView();
+      }
+    } else if(action==1&&confirmBoxStatic("Delete collection?",{g_collections[index].name,"No games will be deleted."})){
+      if(g_activeCollection==g_collections[index].name) g_activeCollection.clear();
+      g_collections.erase(g_collections.begin()+index); saveLibraryOrganization(); rebuildLibraryView();
+    }
+    beginScreenFx();
+  }
+}
+
+static void organizeGame(Game &game) {
+  for(;;){
+    std::vector<std::string> choices;
+    choices.push_back(std::string(LauncherLocalization::Translate("Favorite"))+
+                      (g_favorites.count(game.key)?"  ✓":""));
+    for(const Collection &collection:g_collections)
+      choices.push_back(collection.name+(collection.games.count(game.key)?"  ✓":""));
+    choices.push_back(std::string(LauncherLocalization::Translate("New collection...")));
+    const int selected=chooseLibraryAction("Favorites & collections",choices);
+    if(selected<0) return;
+    if(selected==0){
+      if(!g_favorites.erase(game.key)) g_favorites.insert(game.key);
+    } else if(selected==(int)choices.size()-1){
+      char name[96]{};
+      if(promptTextStatic("Collection name","",name,sizeof(name))&&trim(name).size()){
+        Collection collection{trim(name),{game.key}}; g_collections.emplace_back(std::move(collection));
+      }
+    } else {
+      Collection &collection=g_collections[selected-1];
+      if(!collection.games.erase(game.key)) collection.games.insert(game.key);
+    }
+    saveLibraryOrganization(); rebuildLibraryView(); beginScreenFx();
+  }
+}
+
+static void chooseLibraryFilter() {
+  std::vector<std::string> choices{
+    std::string(LauncherLocalization::Translate("All games")),
+    std::string(LauncherLocalization::Translate("Favorites"))};
+  for(const Collection &collection:g_collections) choices.push_back(collection.name);
+  choices.push_back(std::string(LauncherLocalization::Translate("Search...")));
+  choices.push_back(std::string(LauncherLocalization::Translate("Manage collections")));
+  const int selected=chooseLibraryAction("Filter library",choices);
+  if(selected<0) return;
+  if(selected==0){ g_activeCollection.clear(); g_searchQuery.clear(); }
+  else if(selected==1){ g_activeCollection="favorites"; g_searchQuery.clear(); }
+  else if(selected<2+(int)g_collections.size()){
+    g_activeCollection=g_collections[selected-2].name; g_searchQuery.clear();
+  } else if(selected==2+(int)g_collections.size()){
+    char query[128]{};
+    if(promptTextStatic("Search games",g_searchQuery.c_str(),query,sizeof(query))){
+      g_searchQuery=trim(query); g_activeCollection.clear();
+    }
+  } else manageCollections();
+  rebuildLibraryView(); beginScreenFx();
+}
+
 static int perGameMenu(Game &g) {
-  const char *items[] = { "Launch", "Game settings", "Graphics packs", "Rename game", "Download cover (SteamGridDB)", "Create HOME shortcut", "Manage installed content", "Clear shader caches", "Clear game settings", "Delete game (remove from SD)" };
-  int n=10, sel=0, touchTop=0;
+  const char *items[] = { "Launch", "Game settings", "Graphics packs", "Rename game", "Cover settings", "Create HOME shortcut", "Manage installed content", "Clear shader caches", "Clear game settings", "Favorite / collections", "Delete game (remove from SD)" };
+  int n=11, sel=0, touchTop=0;
   const int menuY=184;
   const int menuStep=std::max(42,std::min(52,(SH-menuY-64)/n));
   const int menuHeight=std::min(46,menuStep-4);
@@ -5307,13 +6629,13 @@ static int perGameMenu(Game &g) {
           }
           else if(sel==3){
             char buf[128];
-            if(promptText("Rename game", g.title.c_str(), buf, sizeof(buf))){
+            if(promptTextStatic("Rename game", g.title.c_str(), buf, sizeof(buf))){
               g.title = buf;
               storeSet(g_titles, g.key.c_str(), buf);
               storeSave(g_titles, TITLES_INI);
             }
           }
-          else if(sel==4){ downloadCover(g); beginScreenFx(); }
+          else if(sel==4){ coverSettings(g); beginScreenFx(); }
           else if(sel==5){ forwarderWizard(g); beginScreenFx(); }
           else if(sel==6){
             if (!g.titleId) showTitleIdUnavailable("Installed content unavailable",g);
@@ -5321,8 +6643,9 @@ static int perGameMenu(Game &g) {
             beginScreenFx();
           }
           else if(sel==7){ clearShaderCaches(g); beginScreenFx(); }
-          else if(sel==8){ g_game.kv.clear(); remove(gp.c_str()); g.hasCfg=false; toast("Game settings cleared"); SDL_Delay(700); beginScreenFx(); }
-          else if(sel==9){
+          else if(sel==8){ g_game.kv.clear(); remove(gp.c_str()); g.hasCfg=false; toastStatic("Game settings cleared"); beginScreenFx(); }
+          else if(sel==9){ organizeGame(g); beginScreenFx(); }
+          else if(sel==10){
             if(g.path.empty()){
               if (installedContentScreen(g.titleId)) return 2;
               beginScreenFx();
@@ -5330,22 +6653,22 @@ static int perGameMenu(Game &g) {
             else {
               struct stat gameStat{};
               if (stat(g.path.c_str(), &gameStat) != 0) {
-                modalMessage("Delete failed", { "The selected game no longer exists.", "No metadata was removed." });
+                modalMessageStatic("Delete failed", { "The selected game no longer exists.", "No metadata was removed." });
                 beginScreenFx();
               } else if (S_ISDIR(gameStat.st_mode)) {
-                modalMessage("Folder deletion disabled", {
+                modalMessageStatic("Folder deletion disabled", {
                   "Extracted game folders are not deleted automatically.",
                   "Remove this folder manually to avoid deleting unrelated files:",
                   g.path
                 });
                 beginScreenFx();
               } else if (!S_ISREG(gameStat.st_mode)) {
-                modalMessage("Delete failed", { "The selected path is not a regular game file." });
+                modalMessageStatic("Delete failed", { "The selected path is not a regular game file." });
                 beginScreenFx();
-              } else if(confirmBox("Delete game?", { g.title, "", "This permanently deletes the game file from",
+              } else if(confirmBoxStatic("Delete game?", { g.title, "", "This permanently deletes the game file from",
                                                   "the SD card. This cannot be undone." })){
                 if (remove(g.path.c_str()) != 0) {
-                  modalMessage("Delete failed", { "The game file could not be removed.", "No metadata was removed." });
+                  modalMessageStatic("Delete failed", { "The game file could not be removed.", "No metadata was removed." });
                   beginScreenFx();
                 } else {
                   remove(coverPath(g).c_str());
@@ -5354,7 +6677,7 @@ static int perGameMenu(Game &g) {
                   storeRemove(g_recent, g.key.c_str());
                   storeSave(g_titles, TITLES_INI);
                   storeSave(g_recent, RECENT_INI);
-                  toast("Game deleted"); SDL_Delay(800);
+                  toastStatic("Game deleted");
                   return 2;
                 }
               }
@@ -5370,7 +6693,7 @@ static int perGameMenu(Game &g) {
     fillRect(cx+5,cy+7,cw,chh,(SDL_Color){0,0,0,60}); fillRect(cx+2,cy+3,cw,chh,(SDL_Color){0,0,0,75});
     if(g.cover){ SDL_SetTextureAlphaMod(g.cover,255); SDL_SetTextureColorMod(g.cover,255,255,255);
       SDL_Rect d={cx,cy,cw,chh}; SDL_RenderCopy(g_ren,g.cover,nullptr,&d); border(cx,cy,cw,chh,2,COL_DIM); }
-    else { fillRect(cx,cy,cw,chh,(SDL_Color){40,44,54,255}); border(cx,cy,cw,chh,2,COL_DIM); drawTextC(g_font,cx+cw/2,cy+chh/2,"NO COVER",COL_DIM); }
+    else { fillRect(cx,cy,cw,chh,(SDL_Color){40,44,54,255}); border(cx,cy,cw,chh,2,COL_DIM); drawStaticTextC(g_font,cx+cw/2,cy+chh/2,"NO COVER",COL_DIM); }
     drawScrollTextL(g_font_big,cx+cw+70,104,SW-(cx+cw+70)-50,g.title.c_str(),COL_TXT);
     char titleIdText[48];
     if(g.titleId) snprintf(titleIdText,sizeof(titleIdText),"Title ID  %016llX",(unsigned long long)g.titleId);
@@ -5383,21 +6706,20 @@ static int perGameMenu(Game &g) {
     fillRect(mx,(int)g_hy,5,menuHeight,COL_SEL);
     for(int i=0;i<n;i++){ int slot=menuY+i*menuStep-5; int y=slot+(menuHeight-TTF_FontHeight(g_font))/2; bool cur=i==sel;
       SDL_Color rc = (i==n-1) ? (SDL_Color){228,120,120,255} : i==2&&!graphicPacksDownloaded ? COL_HI : COL_TXT;
-      const char *label=i==2&&!graphicPacksDownloaded?"Download graphics packs":
-                        i==4&&regularFileExists(coverPath(g))?"Change cover (SteamGridDB)":items[i];
-      drawText(g_font,cx+cw+94,y,label,cur?COL_VAL:rc);
+      const char *label=i==2&&!graphicPacksDownloaded?"Download graphics packs":items[i];
+      drawText(g_font,cx+cw+94,y,LauncherLocalization::Translate(label).data(),cur?COL_VAL:rc);
     }
-    drawSettingsFooter("A  Select       B  Back");
+    drawLocalizedFooter("A  Select       B  Back");
     drawFadeIn();
     SDL_RenderPresent(g_ren);
-    SDL_Delay(8);
+    waitForNextUiFrame();
   }
 }
 
 static void drawSetupProgress(int pct, const char *msg) {
   clearUiBackground();
   if (g_logo) { int s = 140; SDL_Rect ld = {(SW - s) / 2, SH / 2 - 170, s, s}; SDL_RenderCopy(g_ren, g_logo, nullptr, &ld); }
-  drawTextC(g_font, SW / 2, SH / 2 - 10, msg, COL_TXT);
+  drawTextC(g_font, SW / 2, SH / 2 - 10, LauncherLocalization::Translate(msg).data(), COL_TXT);
   int bw = SW * 2 / 3, bx = (SW - bw) / 2, by = SH / 2 + 40, bh = 36;
   border(bx, by, bw, bh, 2, COL_SEL);
   fillRect(bx + 3, by + 3, (bw - 6) * pct / 100, bh - 6, COL_HI);
@@ -5454,8 +6776,27 @@ static bool readEmbeddedEmulatorHash(std::array<u8, SHA256_HASH_SIZE> &hash,
   return true;
 }
 
+static void cleanupLegacyEmuHosts() {
+  static const char *directories[] = {DATA_DIR, EMU_HOST_DIR};
+  static const char *filenames[] = {"cemu_vk.nro", "cemu_gl.nro", "cemu_zink.nro"};
+  static const char *suffixes[] = {"", ".tmp", ".old"};
+  bool changed=false;
+  for(const char *directory:directories)
+    for(const char *filename:filenames)
+      for(const char *suffix:suffixes){
+        const std::string path=std::string(directory)+"/"+filename+suffix;
+        if(remove(path.c_str())==0) changed=true;
+      }
+  const std::string oldMarker=std::string(DATA_DIR)+"/.emu_build";
+  for(const char *suffix:suffixes){
+    const std::string path=oldMarker+suffix;
+    if(remove(path.c_str())==0) changed=true;
+  }
+  if(changed) fsdevCommitDevice("sdmc");
+}
+
 static bool ensureEmu() {
-  std::string marker = std::string(DATA_DIR) + "/.emu_build";
+  std::string marker = std::string(DATA_DIR) + "/.emu_core_build";
   const std::string tmp = std::string(EMU_NRO_DST) + ".tmp";
   const std::string old = std::string(EMU_NRO_DST) + ".old";
   bool destinationExists=false,oldExists=false,tmpExists=false;
@@ -5500,7 +6841,7 @@ static bool ensureEmu() {
     remove(tmp.c_str());
     return false;
   }
-  static char buf[1 << 16]; size_t n; bool ok = true; long long written = 0; int lastPct = -1;
+  static char buf[1 << 20]; size_t n; bool ok = true; long long written = 0; int lastPct = -1;
   Sha256Context hashContext;
   sha256ContextCreate(&hashContext);
   appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
@@ -5513,7 +6854,7 @@ static bool ensureEmu() {
       if(!beginUiFrame()){ ok=false; break; }
       SDL_Event event; while(pollUiEvent(event)) {}
       if(g_exitRequested){ ok=false; break; }
-      drawSetupProgress(pct, "Updating..."); lastPct = pct;
+      drawSetupProgress(pct, "Preparing emulator..."); lastPct = pct;
     }
   }
   if (ferror(in)) ok = false;
@@ -5561,7 +6902,7 @@ static GLay gridLayout(){
   return g;
 }
 static int gridHitTest(int px,int py,int top){
-  GLay L=gridLayout(); int n=(int)g_games.size();
+  GLay L=gridLayout(); int n=(int)g_libraryView.size();
   int rowStride=L.chh+(L.titleH?L.titleH+8:0)+L.gapy;
   for(int r=0;r<L.rows;r++) for(int c=0;c<L.cols;c++){
     int idx=(top+r)*L.cols+c; if(idx>=n) continue;
@@ -5617,11 +6958,11 @@ static void drawScrollTextL(TTF_Font*f,int x,int y,int maxW,const char*s,SDL_Col
 
 static void renderGrid(int sel,int top,const char*gamedirLabel){
   clearUiBackground();
-  g_cover_budget = COVER_DECODE_BUDGET;
-  if(sel>=0 && sel<(int)g_games.size()) ensureCover(g_games[sel]);
+  g_cover_budget = COVER_REQUEST_BUDGET;
+  if(sel>=0 && sel<(int)g_libraryView.size()) ensureCover(*g_libraryView[sel],true);
   GLay L=gridLayout();
-  int n=(int)g_games.size(), per=L.cols*L.rows;
-  int pages=n?(n+per-1)/per:1, page=n?(sel/per)+1:1;
+  int n=(int)g_libraryView.size(), per=L.cols*L.rows;
+  int pages=n?(n+per-1)/per:1,pageIndex=n?sel/per:0,page=pageIndex+1;
   int bandH = L.y0 - 4;
   fillRect(0,0,SW,bandH,COL_PANEL);
   if(!hasAnimatedBackground()) fillRect(0,bandH,SW,2,COL_SEL);
@@ -5637,10 +6978,10 @@ static void renderGrid(int sel,int top,const char*gamedirLabel){
   for(int r=0;r<L.rows;r++) for(int c=0;c<L.cols;c++){
     int idx=(top+r)*L.cols+c;
     if(idx>=n) continue;
-    Game&g=g_games[idx];
+    Game&g=*g_libraryView[idx];
     int x=L.x0+c*(L.cw+L.gapx), y=L.y0+r*rowStride;
     bool cur=(idx==sel);
-    ensureCover(g);
+    ensureCover(g,true);
     fillRect(x+4,y+6,L.cw,L.chh,(SDL_Color){0,0,0,55});
     fillRect(x+2,y+3,L.cw,L.chh,(SDL_Color){0,0,0,70});
     if(g.cover){
@@ -5649,29 +6990,38 @@ static void renderGrid(int sel,int top,const char*gamedirLabel){
       SDL_SetTextureColorMod(g.cover,cur?255:150,cur?255:150,cur?255:150);
       SDL_Rect d={x,y,L.cw,L.chh}; SDL_RenderCopy(g_ren,g.cover,nullptr,&d);
     }
-    else { fillRect(x,y,L.cw,L.chh,COL_CARD); drawTextC(g_font_sm,x+L.cw/2,y+L.chh/2-8,"NO COVER",COL_DIM); }
+    else { fillRect(x,y,L.cw,L.chh,COL_CARD); drawStaticTextC(g_font_sm,x+L.cw/2,y+L.chh/2-8,"NO COVER",COL_DIM); }
     border(x,y,L.cw,L.chh,1,(SDL_Color){12,13,18,255});
     fillRect(x,y,L.cw,1,(SDL_Color){255,255,255,26});
     if(cur){ const int G=6;
       for(int i=G;i>=1;i--){ Uint8 a=(Uint8)(150*(G-i+1)/G); border(x-2-i,y-2-i,L.cw+4+2*i,L.chh+4+2*i,1,(SDL_Color){255,170,0,a}); }
       border(x-2,y-2,L.cw+4,L.chh+4,2,COL_SEL);
     }
-    if(g.region>0 && g_flag[g.region]){
+    if(g_showRegionFlags && g.region>0 && g_flag[g.region]){
       int fw=L.cw*26/100; if(fw>30)fw=30; if(fw<16)fw=16; int fh=fw*2/3;
       SDL_Rect fd={x+6,y+6,fw,fh}; SDL_RenderCopy(g_ren,g_flag[g.region],nullptr,&fd);
       border(x+6,y+6,fw,fh,1,(SDL_Color){10,12,18,255});
     }
-    if(g.hasCfg){ int ds=L.cw/11<12?12:L.cw/11; fillRect(x+L.cw-ds-8,y+8,ds,ds,COL_SEL); border(x+L.cw-ds-8,y+8,ds,ds,2,(SDL_Color){10,12,18,255}); }
+    if(g_showCustomSettingsBadges && g.hasCfg){ int ds=L.cw/11<12?12:L.cw/11; fillRect(x+L.cw-ds-8,y+8,ds,ds,COL_SEL); border(x+L.cw-ds-8,y+8,ds,ds,2,(SDL_Color){10,12,18,255}); }
     if(g_showGameTitles) drawTitleCell(x+L.cw/2,L.cw,y+L.chh+6,g.title,cur,cur?COL_VAL:COL_DIM);
   }
-  if(n==0) drawTextC(g_font,SW/2,SH/2,"No games found -- press X for Settings > Game folder",COL_DIM);
+  if(sel>=0&&sel<n)ensureCover(*g_libraryView[sel],true);
+  const int prefetchStart=(pageIndex+1)*per;
+  for(int index=prefetchStart;index<std::min(n,prefetchStart+per);index++)
+    ensureCover(*g_libraryView[index]);
+  if(n==0) drawTextC(g_font,SW/2,SH/2,
+                     g_games.empty()?"No games found -- press X for Settings > Game folder":"No games match this view",COL_DIM);
   drawUpdateNotification();
   FootItem foot[] = {
-    { g_gA, "Launch", FA_LAUNCH }, { g_gY, "Sort", FA_SORT },
-    { g_gX, "Settings", FA_SETTINGS }, { g_gPlus, "Game Menu", FA_OPTIONS },
-    { g_gL, "", FA_PAGEL }, { g_gR, "Page", FA_PAGER }, { g_gB, "Quit", FA_QUIT },
+    { g_gA, LauncherLocalization::Translate("Launch").data(), FA_LAUNCH },
+    { g_gY, LauncherLocalization::Translate("Sort").data(), FA_SORT },
+    { g_gX, LauncherLocalization::Translate("Settings").data(), FA_SETTINGS },
+    { g_gPlus, LauncherLocalization::Translate("Game Menu").data(), FA_OPTIONS },
+    { g_gMinus, LauncherLocalization::Translate("Filter").data(), FA_FILTER }, { g_gL, "", FA_PAGEL },
+    { g_gR, LauncherLocalization::Translate("Page").data(), FA_PAGER },
+    { g_gB, LauncherLocalization::Translate("Quit").data(), FA_QUIT },
   };
-  drawFooterHints(foot, 7, SH-26);
+  drawFooterHints(foot, 8, SH-26);
   SDL_RenderPresent(g_ren);
 }
 
@@ -5717,6 +7067,8 @@ static bool ensureDirectory(const char *path) {
 
 static void cleanupLauncher() {
   LauncherUpdate_Shutdown();
+  stopGameScan();
+  stopCoverDecodeWorker();
   for (auto &game : g_games) {
     if (game.cover) SDL_DestroyTexture(game.cover);
     game.cover = nullptr;
@@ -5726,7 +7078,8 @@ static void cleanupLauncher() {
     if (g_flag[i]) SDL_DestroyTexture(g_flag[i]);
     g_flag[i] = nullptr;
   }
-  SDL_Texture **glyphs[] = { &g_gA, &g_gB, &g_gX, &g_gY, &g_gPlus, &g_gMinus, &g_gL, &g_gR };
+  SDL_Texture **glyphs[] = { &g_gA, &g_gB, &g_gX, &g_gY, &g_gPlus, &g_gMinus,
+                            &g_gL, &g_gR, &g_gLeftRight, &g_gUpDown };
   for (SDL_Texture **glyph : glyphs) {
     if (*glyph) SDL_DestroyTexture(*glyph);
     *glyph = nullptr;
@@ -5770,6 +7123,61 @@ static int startupFailure(const char *message) {
   return 1;
 }
 
+static bool isAppletMode() {
+  const AppletType type=appletGetAppletType();
+  return type!=AppletType_Application&&type!=AppletType_SystemApplication;
+}
+
+static void runAppletInstaller() {
+  LauncherLocalization::Initialize("system");
+  const int panelWidth=std::min(SW-96,960),panelHeight=std::min(SH-96,500);
+  const int panelX=(SW-panelWidth)/2,panelY=(SH-panelHeight)/2;
+  const int buttonWidth=std::min(520,panelWidth-96),buttonHeight=76;
+  const int buttonX=(SW-buttonWidth)/2,buttonY=panelY+panelHeight-buttonHeight-48;
+  beginScreenFx();
+  for(;;){
+    if(!beginUiFrame()) return;
+    SDL_Event event{}; navRepeat();
+    while(pollUiEvent(event)){
+      int tx=0,ty=0; const TouchKind touch=touchFeed(event,&tx,&ty);
+      const bool pressed=event.type==SDL_CONTROLLERBUTTONDOWN&&event.cbutton.button==BTN_CONFIRM;
+      const bool touched=touch==TOUCH_TAP&&tx>=buttonX&&tx<buttonX+buttonWidth&&ty>=buttonY&&ty<buttonY+buttonHeight;
+      if(pressed||touched){
+        clearUiBackground();
+        drawHeader(LauncherLocalization::Translate("Applet mode installer").data(),nullptr);
+        drawTextC(g_font,SW/2,SH/2,LauncherLocalization::Translate("Installing...").data(),COL_VAL);
+        SDL_RenderPresent(g_ren);
+        appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+        char error[256]{}; const bool installed=forwarder_create_launcher(error,sizeof(error));
+        appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+        if(installed) modalMessageStatic("Cemu",{std::string(LauncherLocalization::Translate("HOME Menu shortcut installed."))});
+        else modalMessageStatic("Shortcut failed",{std::string(error[0]?error:"Unknown error")});
+        beginScreenFx();
+      }
+      if(event.type==SDL_CONTROLLERBUTTONDOWN&&event.cbutton.button==BTN_CANCEL) return;
+    }
+    clearUiBackground();
+    glassPanel(panelX,panelY,panelWidth,panelHeight);
+    border(panelX,panelY,panelWidth,panelHeight,3,COL_SEL);
+    drawTextC(g_font_big,SW/2,panelY+44,LauncherLocalization::Translate("Applet mode installer").data(),COL_SEL);
+    const std::vector<std::string> lines=wrapDialogLines({
+      std::string(LauncherLocalization::Translate("Cemu is running in applet mode.")),
+      std::string(LauncherLocalization::Translate("Install a HOME Menu shortcut to run Cemu with full memory and normal performance."))
+    },panelWidth-96);
+    int lineY=panelY+132;
+    for(const std::string &line:lines){
+      if(lineY+TTF_FontHeight(g_font)>=buttonY-28) break;
+      drawTextC(g_font,SW/2,lineY,line.c_str(),COL_TXT); lineY+=TTF_FontHeight(g_font)+12;
+    }
+    fillRect(buttonX,buttonY,buttonWidth,buttonHeight,COL_FOCUS);
+    border(buttonX,buttonY,buttonWidth,buttonHeight,3,COL_SEL);
+    drawTextC(g_font,SW/2,buttonY+(buttonHeight-TTF_FontHeight(g_font))/2,
+              LauncherLocalization::Translate("Install").data(),COL_VAL);
+    drawLocalizedFooter("A  Install       B  Back",panelY+panelHeight-18);
+    drawFadeIn(); SDL_RenderPresent(g_ren); waitForNextUiFrame();
+  }
+}
+
 int main(int argc, char **argv){
   if(argc>=1 && argv[0] && argv[0][0]){
     g_forwarderSelfPath=argv[0];
@@ -5784,6 +7192,7 @@ int main(int argc, char **argv){
   SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,"linear");
   if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMECONTROLLER|SDL_INIT_AUDIO)!=0) return startupFailure("SDL initialization failed.");
   g_sdlReady = true;
+  LauncherUpdate_SetWakeCallback([](void*){ wakeUiFromWorker(0x55504454); },nullptr);
   uiAudioInit();
   if(TTF_Init()!=0) return startupFailure("Font initialization failed.");
   g_ttfReady = true;
@@ -5817,6 +7226,13 @@ int main(int argc, char **argv){
   g_font_big=openFont(sc?52:40);
   if(!g_font_sm || !g_font || !g_font_big) return startupFailure("Could not open the system font.");
   makeGlyphs();
+  if(isAppletMode()){
+    (void)ensureDirectory("sdmc:/switch");
+    (void)ensureDirectory(DATA_DIR);
+    runAppletInstaller();
+    cleanupLauncher();
+    return 0;
+  }
   g_griddbReady = griddb_global_init();
   if(!g_griddbReady && R_SUCCEEDED(socketInitializeDefault())) g_storageSocketReady=true;
 
@@ -5827,16 +7243,10 @@ int main(int argc, char **argv){
   };
   for (const char *directory : directories)
     if (!ensureDirectory(directory)) return startupFailure("Could not create the Cemu data directories.");
+  cleanupLegacyEmuHosts();
 
   if(!updateRecoveryOk)
-    modalMessage("Update recovery failed",{updateRecoveryError,"The installed launcher was left unchanged."});
-
-  if(!ensureEmu())
-    modalMessage("Emulator setup failed", {
-      "Could not install the emulator to the SD card.",
-      "The SD card may be full or write-protected.",
-      "",
-      "Free up space and relaunch." });
+    modalMessageStatic("Update recovery failed",{updateRecoveryError,"The installed launcher was left unchanged."});
 
   struct stat bst;
   bool firstRun = (stat(LAUNCHER_INI, &bst) != 0);
@@ -5844,6 +7254,8 @@ int main(int argc, char **argv){
   storeLoad(g_titles, TITLES_INI);
   storeLoad(g_recent, RECENT_INI);
   storeLoad(g_containerTitles, CONTAINER_TITLES_INI);
+  storeLoad(g_gameIdentities, GAME_IDENTITIES_INI);
+  loadLibraryOrganization();
   { int sm = atoi(storeGet(g_global,"Wrapper/SortMode","0")); if(sm>=0 && sm<SORT_COUNT) g_sort = sm; }
   if (firstRun) {
     g_active = &g_global;
@@ -5851,10 +7263,14 @@ int main(int argc, char **argv){
     storeSet(g_global, "Wrapper/SteamGridDBKey", "");
     storeSet(g_global, "Wrapper/UiSounds", "true");
     storeSet(g_global, "Wrapper/Theme", "homebrew");
+    storeSet(g_global, "Wrapper/Language", "system");
+    storeSet(g_global, "Wrapper/Renderer", "vk");
     storeSet(g_global, "console_language", "-1");
     storeSet(g_global, "Wrapper/GridColumns", "5");
     storeSet(g_global, "Wrapper/GridRows", "2");
     storeSet(g_global, "Wrapper/ShowGameTitles", "true");
+    storeSet(g_global, "Wrapper/ShowRegionFlags", "true");
+    storeSet(g_global, "Wrapper/ShowCustomSettingsBadges", "true");
     storeSet(g_global, "Wrapper/UiAnimations", "true");
     storeSet(g_global, "Wrapper/CheckUpdatesAtBoot", "true");
     storeSet(g_global, "Wrapper/InstalledReleaseTag", LauncherUpdate_BuiltReleaseTag());
@@ -5866,27 +7282,38 @@ int main(int argc, char **argv){
     if(columns<3||columns>8){ storeSet(g_global,"Wrapper/GridColumns","5"); changed=true; }
     if(changed) storeSave(g_global,LAUNCHER_INI);
   }
+  LauncherLocalization::Initialize(storeGet(g_global,"Wrapper/Language","system"));
   applyLauncherAppearance();
   uiAudioSetEnabled(strcmp(storeGet(g_global,"Wrapper/UiSounds","true"),"false")!=0);
+  startCoverDecodeWorker();
   std::vector<std::string> gamePaths=loadGameSources();
-  bool hasUsbSource=hasConfiguredUsbSource(gamePaths);
-  SwitchStorage::InitializeFromConfig(LAUNCHER_INI,hasUsbSource);
-  uint64_t usbGeneration=SwitchStorage::UsbStatusGeneration();
-  refreshConfiguredUsbSources(gamePaths);
-  scanGames(gamePaths);
+  bool hasUsbSource=hasConfiguredUsbSource(gamePaths)||hasConfiguredUsbBinding();
+  std::atomic<bool> storageInitDone{false},storageInitCancel{false};
+  std::thread storageInitWorker([&]{
+    SwitchStorage::SetUsbStatusCallback(usbStatusWake,nullptr);
+    if(hasUsbSource&&!storageInitCancel.load()) SwitchStorage::InitializeUsb();
+    for(const auto &share:loadSmbSharesFromStore()){
+      if(storageInitCancel.load()) break;
+      if(share.autoMount){ std::string error; SwitchStorage::MountSmb(share,&error,&storageInitCancel); }
+    }
+    storageInitDone=true;
+    wakeUiFromWorker(0x53544f52);
+  });
+  SwitchStorage::UsbSnapshot usbSnapshot;
+  uint64_t usbGeneration=0;
+  startGameScan(gamePaths,true);
+  bool storageIntegrated=false;
   Uint32 usbRefreshAt=0;
-  const uint64_t startupUsbGeneration=SwitchStorage::UsbStatusGeneration();
-  if(startupUsbGeneration!=usbGeneration){ usbGeneration=startupUsbGeneration; usbRefreshAt=SDL_GetTicks()+300; }
 
   if (!cemu_hasConfiguredDiscKey("sdmc:/switch/cemu/keys.txt"))
-    modalMessage("Disc key required", {
+    modalMessageStatic("Disc key required", {
       "Cemu/keys.txt does not contain a Wii U disc key.",
       "WUX games cannot be decrypted until a valid key is added.",
       "",
       "Add the key to sdmc:/switch/cemu/keys.txt." });
 
   int sel=0, top=0, rows=1;
-  bool running=true, launch=false;
+  bool running=true, launch=false,userExit=false;
   std::string launchKey;
   std::string launchPath;
   uint64_t launchTitleId=0;
@@ -5898,6 +7325,14 @@ int main(int argc, char **argv){
     launchTitleId = game.titleId;
     launch = true;
     running = false;
+  };
+  auto requestExit=[&](){
+    if(!confirmBox(LauncherLocalization::Translate("Exit Cemu?").data(),{
+         std::string(LauncherLocalization::Translate("Active scans and network operations will be cancelled safely.")),
+         std::string(LauncherLocalization::Translate("Return to the HOME Menu?"))})){
+      beginScreenFx(); return false;
+    }
+    userExit=true; running=false; return true;
   };
 
   bool forwarderRequested=false,forwarderMatched=false;
@@ -5911,26 +7346,67 @@ int main(int argc, char **argv){
   if(!forwarderRequested&&g_griddbReady&&
      strcmp(storeGet(g_global,"Wrapper/CheckUpdatesAtBoot","true"),"false")!=0)
     LauncherUpdate_StartCheck(installedReleaseTag());
-  bool forwarderPending=forwarderRequested&&!forwarderMatched&&hasUsbSource;
-  const Uint32 forwarderDeadline=forwarderPending?SDL_GetTicks()+6000:0;
+  bool forwarderPending=forwarderRequested&&!forwarderMatched;
+  const Uint32 forwarderDeadline=forwarderPending?SDL_GetTicks()+10000:0;
   if(forwarderPending&&!usbRefreshAt) usbRefreshAt=SDL_GetTicks()+300;
-  if(forwarderRequested&&!forwarderMatched&&!forwarderPending){
-    modalMessage("Game not found",{"The shortcut's game is not in the current library.","","Reconnect its storage or update the game folders."});
-    running=false;
-  }
-
+  std::vector<std::string> pendingMountedSources;
   while(running && beginUiFrame()){
-    if(hasUsbSource){
+    pumpGameScan();
+    if(!g_libraryScan&&!pendingMountedSources.empty()){
+      startGameScan(std::move(pendingMountedSources),false);
+      pendingMountedSources.clear();
+    }
+    if(sel>=(int)g_libraryView.size()) sel=std::max(0,(int)g_libraryView.size()-1);
+    if(storageInitDone.load()&&!storageIntegrated){
+      if(storageInitWorker.joinable()) storageInitWorker.join();
+      storageIntegrated=true;
+      usbSnapshot=SwitchStorage::GetUsbSnapshot();
+      usbGeneration=usbSnapshot.generation;
+      gamePaths=loadGameSources();
+      refreshConfiguredUsbSources(gamePaths);
+      std::vector<std::string> mountedSources;
+      for(const std::string &source:gamePaths)
+        if(isUsbStoragePath(source)||source.rfind("cemusmb_",0)==0) mountedSources.push_back(source);
+      pendingMountedSources=std::move(mountedSources);
+    }
+    if(hasUsbSource&&storageIntegrated){
       const Uint32 now=SDL_GetTicks();
       const uint64_t generation=SwitchStorage::UsbStatusGeneration();
       if(generation!=usbGeneration){ usbGeneration=generation; usbRefreshAt=now+300; }
       if(usbRefreshAt&&SDL_TICKS_PASSED(now,usbRefreshAt)){
         usbRefreshAt=0;
-        const std::string selected=!g_games.empty()?g_games[sel].key:std::string{};
+        const std::string selected=!g_libraryView.empty()?g_libraryView[sel]->key:std::string{};
+        const SwitchStorage::UsbSnapshot nextSnapshot=SwitchStorage::GetUsbSnapshot();
+        std::unordered_map<std::string,std::string> previousPaths,nextPaths;
+        for(const auto &location:usbSnapshot.locations) previousPaths[location.id]=pathIdentity(location.path);
+        for(const auto &location:nextSnapshot.locations) nextPaths[location.id]=pathIdentity(location.path);
+        std::unordered_set<std::string> invalidated,needsScan;
+        for(const auto &entry:previousPaths){
+          const auto current=nextPaths.find(entry.first);
+          if(current==nextPaths.end()||current->second!=entry.second) invalidated.insert(entry.first);
+          if(current!=nextPaths.end()&&current->second!=entry.second) needsScan.insert(entry.first);
+        }
+        for(const auto &entry:nextPaths) if(!previousPaths.count(entry.first)) needsScan.insert(entry.first);
+        // A device can disappear and return between populate callbacks with the
+        // same stable ID and ums alias. The generation still proves its media
+        // may have changed, so reconcile only configured USB roots.
+        if(invalidated.empty()&&needsScan.empty()){
+          for(const std::string &source:gamePaths){
+            const std::string id=usbStableIdForPath(source);
+            if(!id.empty()){ invalidated.insert(id); needsScan.insert(id); }
+          }
+        }
+        usbSnapshot=nextSnapshot;
+        removeGamesFromUsbDevices(invalidated);
         refreshConfiguredUsbSources(gamePaths);
-        scanGames(gamePaths);
+        std::vector<std::string> changedUsbSources;
+        for(const std::string &source:gamePaths){
+          const std::string id=usbStableIdForPath(source);
+          if(!id.empty()&&needsScan.count(id)) changedUsbSources.push_back(source);
+        }
+        if(!changedUsbSources.empty()) pendingMountedSources=std::move(changedUsbSources);
         sel=0;
-        if(!selected.empty()) for(size_t index=0;index<g_games.size();index++) if(g_games[index].key==selected){ sel=(int)index; break; }
+        if(!selected.empty()) for(size_t index=0;index<g_libraryView.size();index++) if(g_libraryView[index]->key==selected){ sel=(int)index; break; }
         top=0;
         if(forwarderPending) if(Game *game=findGameByKey(forwarderKey)){
           selectGame(*game);
@@ -5939,7 +7415,7 @@ int main(int argc, char **argv){
       }
       if(forwarderPending&&SDL_TICKS_PASSED(now,forwarderDeadline)){
         forwarderPending=false;
-        modalMessage("Game not found",{"The shortcut's game is not in the current library.","","Reconnect its storage or update the game folders."});
+        modalMessageStatic("Game not found",{"The shortcut's game is not in the current library.","","Reconnect its storage or update the game folders."});
         running=false;
       }
       if(!running) break;
@@ -5954,8 +7430,13 @@ int main(int argc, char **argv){
         }
       }
       if(!running) break;
+      if(Game *game=findGameByKey(forwarderKey)){
+        selectGame(*game);
+        forwarderPending=false;
+        break;
+      }
       renderUsbForwarderWait();
-      SDL_Delay(8);
+    waitForNextUiFrame();
       continue;
     }
     GLay L=gridLayout();
@@ -5965,13 +7446,13 @@ int main(int argc, char **argv){
     navRepeat();
     while(pollUiEvent(e)){
       pumpStick(e);
-      { int tx=0,ty=0,n=(int)g_games.size(); TouchKind tk=touchFeed(e,&tx,&ty);
+      { int tx=0,ty=0,n=(int)g_libraryView.size(); TouchKind tk=touchFeed(e,&tx,&ty);
         if(tk==TOUCH_SWIPE_L||tk==TOUCH_SWIPE_R){ sel=gridPage(sel,tk==TOUCH_SWIPE_L?+1:-1,cols,rows,n); top=n?(sel/(cols*rows))*rows:0; continue; }
         if(tk==TOUCH_TAP){
           int fa=footTapAct(tx,ty);
           if(fa==FA_NONE){ int hit=gridHitTest(tx,ty,top);
             if(hit>=0){
-              if(hit==sel && n) selectGame(g_games[sel]);
+              if(hit==sel && n) selectGame(*g_libraryView[sel]);
               else sel=hit;
             }
           } else {
@@ -5981,9 +7462,10 @@ int main(int argc, char **argv){
               case FA_SORT:     a.cbutton.button=SDL_CONTROLLER_BUTTON_X; SDL_PushEvent(&a); break;
               case FA_OPTIONS:  a.cbutton.button=SDL_CONTROLLER_BUTTON_START; SDL_PushEvent(&a); break;
               case FA_SETTINGS: a.cbutton.button=BTN_SETTINGS; SDL_PushEvent(&a); break;
+              case FA_FILTER:   a.cbutton.button=SDL_CONTROLLER_BUTTON_BACK; SDL_PushEvent(&a); break;
               case FA_PAGEL:    sel=gridPage(sel,-1,cols,rows,n); break;
               case FA_PAGER:    sel=gridPage(sel,+1,cols,rows,n); break;
-              case FA_QUIT:     running=false; break;
+              case FA_QUIT:     requestExit(); break;
             }
           }
           top=n?(sel/(cols*rows))*rows:0;
@@ -5992,7 +7474,7 @@ int main(int argc, char **argv){
         }
       }
       if(e.type!=SDL_CONTROLLERBUTTONDOWN) continue;
-      int n=(int)g_games.size();
+      int n=(int)g_libraryView.size();
       switch(e.cbutton.button){
         case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  sel=gridNav(sel,-1,0,cols,rows,n); break;
         case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: sel=gridNav(sel,+1,0,cols,rows,n); break;
@@ -6000,23 +7482,25 @@ int main(int argc, char **argv){
         case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  sel=gridNav(sel,0,+1,cols,rows,n); break;
         case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  sel=gridPage(sel,-1,cols,rows,n); break;
         case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: sel=gridPage(sel,+1,cols,rows,n); break;
+        case SDL_CONTROLLER_BUTTON_BACK:
+          chooseLibraryFilter(); sel=0; top=0; break;
         case SDL_CONTROLLER_BUTTON_X:
           if(n){
-            std::string keep=g_games[sel].key;
+            std::string keep=g_libraryView[sel]->key;
             g_sort=(g_sort+1)%SORT_COUNT;
             char sb[8]; snprintf(sb,sizeof(sb),"%d",g_sort);
             storeSet(g_global,"Wrapper/SortMode",sb); storeSave(g_global,LAUNCHER_INI);
             applySort();
-            sel=0; for(int i=0;i<n;i++) if(g_games[i].key==keep){ sel=i; break; }
+            sel=0; for(int i=0;i<(int)g_libraryView.size();i++) if(g_libraryView[i]->key==keep){ sel=i; break; }
           }
           break;
         case BTN_CONFIRM:
-          if(n) selectGame(g_games[sel]);
+          if(n) selectGame(*g_libraryView[sel]);
           break;
         case SDL_CONTROLLER_BUTTON_START:
-          if(n){ int r=perGameMenu(g_games[sel]);
-            if(r==1) selectGame(g_games[sel]);
-            else if(r==2){ scanGames(gamePaths); sel=0; top=0; } }
+          if(n){ int r=perGameMenu(*g_libraryView[sel]);
+            if(r==1) selectGame(*g_libraryView[sel]);
+            else if(r==2){ startGameScan(gamePaths,true); sel=0; top=0; } }
           break;
         case BTN_SETTINGS: {
           std::vector<std::string> oldPaths=gamePaths;
@@ -6025,27 +7509,52 @@ int main(int argc, char **argv){
           { GLay updated=gridLayout(); cols=updated.cols; rows=updated.rows; }
           gamePaths=loadGameSources();
           if(gamePaths!=oldPaths||g_rescanAfterSettings){
-            hasUsbSource=hasConfiguredUsbSource(gamePaths);
+            hasUsbSource=hasConfiguredUsbSource(gamePaths)||hasConfiguredUsbBinding();
             if(hasUsbSource) SwitchStorage::InitializeUsb();
-            usbGeneration=SwitchStorage::UsbStatusGeneration();
+            usbSnapshot=SwitchStorage::GetUsbSnapshot();
+            usbGeneration=usbSnapshot.generation;
             usbRefreshAt=0;
             refreshConfiguredUsbSources(gamePaths);
-            scanGames(gamePaths);
+            startGameScan(gamePaths,true);
             sel=0;
             top=0;
             g_rescanAfterSettings=false;
           }
           break;
         }
-        case BTN_CANCEL: running=false; break;
+        case BTN_CANCEL: requestExit(); break;
       }
       top = n ? (sel/(cols*rows))*rows : 0;
     }
     pollUpdateNotification();
-    const std::string location=!g_games.empty()?gameLocationLabel(g_games[sel]):"No game selected";
+    const std::string location=!g_libraryView.empty()?gameLocationLabel(*g_libraryView[sel]):"No game selected";
     renderGrid(sel,top,location.c_str());
-    SDL_Delay(8);
+    waitForNextUiFrame();
   }
+
+  if(userExit){
+    auto renderClosing=[&](){
+      clearUiBackground();
+      drawHeaderStatic("Cemu",nullptr);
+      drawTextC(g_font_big,SW/2,SH/2-48,LauncherLocalization::Translate("Closing Cemu...").data(),COL_VAL);
+      drawTextC(g_font_sm,SW/2,SH/2+30,LauncherLocalization::Translate("Finishing background operations safely.").data(),COL_DIM);
+      SDL_RenderPresent(g_ren);
+    };
+    renderClosing();
+    SwitchStorage::SetUsbStatusCallback(nullptr,nullptr);
+    storageInitCancel=true;
+    if(g_libraryScan) g_libraryScan->cancel=true;
+    Uint32 nextFrame=SDL_GetTicks()+100;
+    while((g_libraryScan&&!g_libraryScan->done.load())||!storageInitDone.load()){
+      SDL_PumpEvents();
+      if(SDL_TICKS_PASSED(SDL_GetTicks(),nextFrame)){ renderClosing(); nextFrame=SDL_GetTicks()+100; }
+      if(!appletMainLoop()) break;
+      svcSleepThread(16000000);
+    }
+  }
+  storageInitCancel=true;
+  if(storageInitWorker.joinable()) storageInitWorker.join();
+  stopGameScan();
 
   g_active=&g_global;
   if(launch) commitAll();
@@ -6054,10 +7563,13 @@ int main(int argc, char **argv){
 
   bool willChain = false;
   if(launch && envHasNextLoad()){
-    struct stat est; bool haveEmu = (stat(EMU_NRO_DST, &est) == 0);
+    std::vector<CemuKV> eff = buildEffectiveSettings(launchKey);
+    const char *configuredRenderer=cemuKVGet(eff,"Wrapper/Renderer","vk");
+    const std::string renderer=!strcmp(configuredRenderer,"gl") ? "gl" :
+                               !strcmp(configuredRenderer,"zink") ? "zink" : "vk";
+    const bool haveEmu=ensureEmu();
     appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
 
-    std::vector<CemuKV> eff = buildEffectiveSettings(launchKey);
     std::vector<CemuGraphicPack> enabledPacks;
     bool configOk = haveEmu && readEnabledPacks(enabledPacks);
     if (configOk) configOk = cemu_writeSettingsXml(SETTINGS_XML, eff, gamePaths, enabledPacks);
@@ -6069,10 +7581,11 @@ int main(int argc, char **argv){
     }
     if (configOk) {
       std::string handoff;
-      bool lsfgPrepared = !strcmp(cemuKVGet(eff,"Wrapper/LSFGEnabled","false"),"true");
+      bool lsfgPrepared = renderer=="vk" &&
+                          !strcmp(cemuKVGet(eff,"Wrapper/LSFGEnabled","false"),"true");
       if (lsfgPrepared && !regularFileExists(LSFG_DLL_FILE)) {
         lsfgPrepared = false;
-        modalMessage("LSFG disabled for this launch", {
+        modalMessageStatic("LSFG disabled for this launch", {
           "Lossless.dll was not found at",
           "sdmc:/switch/cemu/lsfg/Lossless.dll"
         });
@@ -6080,6 +7593,7 @@ int main(int argc, char **argv){
       configOk = appendHandoffValue(handoff, "timer_shift", cemuKVGet(eff,"TimerShiftFactor","3")) &&
                  appendHandoffValue(handoff, "triple_buffer", cemuKVGet(eff,"TripleBuffer","1")) &&
                  appendHandoffValue(handoff, "cpu_mode", cemuKVGet(eff,"cpuMode","3")) &&
+                 appendHandoffValue(handoff, "renderer", renderer) &&
                  appendHandoffValue(handoff, "gamepad_layout", cemuKVGet(eff,"GamePadLayout","off")) &&
                  appendHandoffValue(handoff, "lsfg_enabled", lsfgPrepared ? "true" : "false") &&
                  appendHandoffValue(handoff, "lsfg_flow_scale", cemuKVGet(eff,"Wrapper/LSFGFlowScale","0.25")) &&
@@ -6101,9 +7615,13 @@ int main(int argc, char **argv){
     else {
       remove(LAUNCH_HANDOFF);
       if (!haveEmu) {
-        toast("Emulator missing - copy cemu.nro into sdmc:/switch/cemu/"); SDL_Delay(2400);
+        modalMessageStatic("Emulator setup failed", {
+          "The embedded Cemu core could not be prepared.",
+          "The SD card may be full or write-protected.",
+          "Free some space and try launching the game again."
+        });
       } else {
-        modalMessage("Launch configuration failed", {
+        modalMessageStatic("Launch configuration failed", {
           "Cemu configuration could not be updated safely.",
           "The previous settings were preserved.",
           "Check free SD space and file permissions."

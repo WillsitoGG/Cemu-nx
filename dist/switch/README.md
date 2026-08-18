@@ -3,9 +3,9 @@
 The launcher and runtime use the lowercase directory `sdmc:/switch/cemu/`.
 Install the final `cemu.nro` as `sdmc:/switch/cemu/cemu.nro`.
 
-## Vulkan SDK
+## Unified Mesa SDK
 
-Extract the complete Mesa 26.2.0 Switch Vulkan SDK into
+Extract the complete Mesa 26.2.0 Switch unified SDK into
 `dependencies/switch_mesa_vulkan/`, then verify it with:
 
 ```sh
@@ -13,7 +13,9 @@ Extract the complete Mesa 26.2.0 Switch Vulkan SDK into
 ```
 
 The private driver payload is ignored by Git. The build localizes its archives
-into one link object without adding those archives to the repository.
+into one link object shared by native Vulkan and Zink, while native NVC0 and
+Zink OpenGL are linked from the same SDK. The resulting core contains all three
+rendering backends.
 
 ## LSFG-VK
 
@@ -42,7 +44,7 @@ The SDL launcher checks the latest published release from
 Set `RELEASE_VERSION` to the GitHub tag when making a release:
 
 ```sh
-RELEASE_VERSION=1.1.2 BUILD_JOBS=18 ./build_switch_all.sh
+RELEASE_VERSION=1.1.3 BUILD_JOBS=18 ./build_switch_all.sh
 ```
 
 The updater requires GitHub's SHA-256 asset digest and validates both the

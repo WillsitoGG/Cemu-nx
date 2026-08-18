@@ -209,6 +209,13 @@ static void ImGui_ImplOpenGL3_SetupRenderState(ImDrawData* draw_data, int fb_wid
 	glDisable(GL_CULL_FACE);
 	glDisable(GL_DEPTH_TEST);
 	glEnable(GL_SCISSOR_TEST);
+#ifndef IMGUI_IMPL_OPENGL_ES2
+	// ImGui uses a monolithic program.  Keep Cemu's separable game pipeline out of
+	// the draw and disable the application's primitive-restart state while using
+	// ImDrawIdx indices, matching the current upstream OpenGL backend.
+	glBindProgramPipeline(0);
+	glDisable(GL_PRIMITIVE_RESTART);
+#endif
 #ifdef GL_POLYGON_MODE
 	glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 #endif
@@ -265,6 +272,9 @@ void    ImGui_ImplOpenGL3_RenderDrawData(ImDrawData* draw_data)
 	GLenum last_active_texture; glGetIntegerv(GL_ACTIVE_TEXTURE, (GLint*)&last_active_texture);
 	glActiveTexture(GL_TEXTURE0);
 	GLint last_program; glGetIntegerv(GL_CURRENT_PROGRAM, &last_program);
+#ifndef IMGUI_IMPL_OPENGL_ES2
+	GLint last_program_pipeline; glGetIntegerv(GL_PROGRAM_PIPELINE_BINDING, &last_program_pipeline);
+#endif
 	GLint last_texture; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_texture);
 #ifdef GL_SAMPLER_BINDING
 	GLint last_sampler; glGetIntegerv(GL_SAMPLER_BINDING, &last_sampler);
@@ -288,6 +298,9 @@ void    ImGui_ImplOpenGL3_RenderDrawData(ImDrawData* draw_data)
 	GLboolean last_enable_cull_face = glIsEnabled(GL_CULL_FACE);
 	GLboolean last_enable_depth_test = glIsEnabled(GL_DEPTH_TEST);
 	GLboolean last_enable_scissor_test = glIsEnabled(GL_SCISSOR_TEST);
+#ifndef IMGUI_IMPL_OPENGL_ES2
+	GLboolean last_enable_primitive_restart = glIsEnabled(GL_PRIMITIVE_RESTART);
+#endif
 	bool clip_origin_lower_left = true;
 #if defined(GL_CLIP_ORIGIN) && !defined(__APPLE__)
 	GLenum last_clip_origin = 0; glGetIntegerv(GL_CLIP_ORIGIN, (GLint*)&last_clip_origin); // Support for GL 4.5's glClipControl(GL_UPPER_LEFT)
@@ -365,6 +378,10 @@ void    ImGui_ImplOpenGL3_RenderDrawData(ImDrawData* draw_data)
 
 	// Restore modified GL state
 	glUseProgram(last_program);
+#ifndef IMGUI_IMPL_OPENGL_ES2
+	glBindProgramPipeline((GLuint)last_program_pipeline);
+	if (last_enable_primitive_restart) glEnable(GL_PRIMITIVE_RESTART); else glDisable(GL_PRIMITIVE_RESTART);
+#endif
 	glBindTexture(GL_TEXTURE_2D, last_texture);
 #ifdef GL_SAMPLER_BINDING
 	glBindSampler(0, last_sampler);

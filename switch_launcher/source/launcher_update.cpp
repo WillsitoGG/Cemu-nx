@@ -21,7 +21,7 @@
 #include <unistd.h>
 
 #ifndef CEMU_SWITCH_RELEASE_VERSION
-#define CEMU_SWITCH_RELEASE_VERSION "1.1.2"
+#define CEMU_SWITCH_RELEASE_VERSION "1.1.3"
 #endif
 
 #ifndef CEMU_SWITCH_VERSION
@@ -46,6 +46,15 @@ namespace
 	std::atomic_bool s_cancel{false};
 	std::atomic_uint64_t s_downloaded{0};
 	std::atomic_uint64_t s_total{0};
+	std::atomic<LauncherUpdateWakeCallback> s_wakeCallback{nullptr};
+	std::atomic<void*> s_wakeData{nullptr};
+	std::atomic_uint64_t s_lastWakeProgress{0};
+
+	void WakeUi()
+	{
+		if (const auto callback=s_wakeCallback.load(std::memory_order_acquire))
+			callback(s_wakeData.load(std::memory_order_acquire));
+	}
 
 	bool StartsWith(std::string_view value, std::string_view prefix)
 	{
@@ -466,7 +475,12 @@ namespace
 		if (total > 0)
 			s_total.store(static_cast<std::uint64_t>(total), std::memory_order_relaxed);
 		if (current >= 0)
+		{
 			s_downloaded.store(static_cast<std::uint64_t>(current), std::memory_order_relaxed);
+			const uint64_t value=static_cast<uint64_t>(current);
+			uint64_t previous=s_lastWakeProgress.load(std::memory_order_relaxed);
+			if(value>=previous+256*1024&&s_lastWakeProgress.compare_exchange_strong(previous,value)) WakeUi();
+		}
 		return s_cancel.load(std::memory_order_relaxed) ? 1 : 0;
 	}
 
@@ -687,6 +701,7 @@ bool LauncherUpdate_StartCheck(const std::string& installedTag)
 		s_release = {};
 		s_error.clear();
 	}
+	WakeUi();
 	s_worker = std::thread([installedTag] {
 		LauncherReleaseInfo release;
 		std::string error;
@@ -712,6 +727,7 @@ bool LauncherUpdate_StartCheck(const std::string& installedTag)
 		}
 		else
 			s_state = LauncherUpdateState::UpToDate;
+		WakeUi();
 	});
 	return true;
 }
@@ -734,6 +750,7 @@ bool LauncherUpdate_StartDownload(const std::string& launcherPath)
 		s_error.clear();
 		s_state = LauncherUpdateState::Downloading;
 	}
+	s_lastWakeProgress=0; WakeUi();
 	s_worker = std::thread([release = std::move(release), launcherPath] {
 		std::string error;
 		const bool success = DownloadRelease(release, launcherPath, error);
@@ -746,6 +763,7 @@ bool LauncherUpdate_StartDownload(const std::string& launcherPath)
 			s_state = s_cancel.load(std::memory_order_relaxed)
 				? LauncherUpdateState::Cancelled : LauncherUpdateState::Error;
 		}
+		WakeUi();
 	});
 	return true;
 }
@@ -758,6 +776,7 @@ bool LauncherUpdate_InstallDownloaded(const std::string& launcherPath)
 			return false;
 		s_state = LauncherUpdateState::Installing;
 	}
+	WakeUi();
 	JoinWorker();
 	std::string error;
 	const bool success = ReplaceLauncher(launcherPath, launcherPath + ".update.tmp", error);
@@ -771,12 +790,20 @@ bool LauncherUpdate_InstallDownloaded(const std::string& launcherPath)
 			s_state = LauncherUpdateState::Error;
 		}
 	}
+	WakeUi();
 	return success;
 }
 
 void LauncherUpdate_Cancel()
 {
 	s_cancel.store(true, std::memory_order_relaxed);
+	WakeUi();
+}
+
+void LauncherUpdate_SetWakeCallback(LauncherUpdateWakeCallback callback, void* userData)
+{
+	s_wakeData.store(callback?userData:nullptr,std::memory_order_release);
+	s_wakeCallback.store(callback,std::memory_order_release);
 }
 
 LauncherUpdateSnapshot LauncherUpdate_GetSnapshot()
@@ -797,6 +824,7 @@ void LauncherUpdate_Shutdown()
 {
 	s_cancel.store(true, std::memory_order_relaxed);
 	JoinWorker();
+	LauncherUpdate_SetWakeCallback(nullptr,nullptr);
 }
 
 bool LauncherUpdate_RecoverInstallation(const std::string& launcherPath, std::string& error)
