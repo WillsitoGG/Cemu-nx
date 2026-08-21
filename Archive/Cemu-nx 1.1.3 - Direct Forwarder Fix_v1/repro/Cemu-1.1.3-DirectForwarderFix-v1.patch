@@ -1,0 +1,208 @@
+diff --git a/switch_launcher/source/main.cpp b/switch_launcher/source/main.cpp
+index ae95174..1ab55ef 100644
+--- a/switch_launcher/source/main.cpp
++++ b/switch_launcher/source/main.cpp
+@@ -7285,14 +7285,26 @@ int main(int argc, char **argv){
+   LauncherLocalization::Initialize(storeGet(g_global,"Wrapper/Language","system"));
+   applyLauncherAppearance();
+   uiAudioSetEnabled(strcmp(storeGet(g_global,"Wrapper/UiSounds","true"),"false")!=0);
++
++  // Standard NSP forwarders pass the selected Wii U title path as argv[1].
++  // Detect this before the normal library/storage pipeline so the direct path
++  // can be resolved without ever presenting the launcher grid or wait screen.
++  std::string positionalForwarderPath;
++  if(argc>=2&&argv[1]&&argv[1][0]&&argv[1][0]!='-')
++    positionalForwarderPath=normalizeLocationPath(argv[1]);
++  const bool silentDirectForwarder=!positionalForwarderPath.empty();
++
+   startCoverDecodeWorker();
+   std::vector<std::string> gamePaths=loadGameSources();
+   bool hasUsbSource=hasConfiguredUsbSource(gamePaths)||hasConfiguredUsbBinding();
++  const bool directForwarderUsesUsb=silentDirectForwarder&&isUsbStoragePath(positionalForwarderPath);
++  if(directForwarderUsesUsb) hasUsbSource=true;
+   std::atomic<bool> storageInitDone{false},storageInitCancel{false};
+   std::thread storageInitWorker([&]{
+     SwitchStorage::SetUsbStatusCallback(usbStatusWake,nullptr);
+-    if(hasUsbSource&&!storageInitCancel.load()) SwitchStorage::InitializeUsb();
+-    for(const auto &share:loadSmbSharesFromStore()){
++    const bool initializeUsb=(!silentDirectForwarder&&hasUsbSource)||directForwarderUsesUsb;
++    if(initializeUsb&&!storageInitCancel.load()) SwitchStorage::InitializeUsb();
++    if(!silentDirectForwarder) for(const auto &share:loadSmbSharesFromStore()){
+       if(storageInitCancel.load()) break;
+       if(share.autoMount){ std::string error; SwitchStorage::MountSmb(share,&error,&storageInitCancel); }
+     }
+@@ -7301,11 +7313,14 @@ int main(int argc, char **argv){
+   });
+   SwitchStorage::UsbSnapshot usbSnapshot;
+   uint64_t usbGeneration=0;
+-  startGameScan(gamePaths,true);
++  if(!silentDirectForwarder) startGameScan(gamePaths,true);
+   bool storageIntegrated=false;
+   Uint32 usbRefreshAt=0;
+ 
+-  if (!cemu_hasConfiguredDiscKey("sdmc:/switch/cemu/keys.txt"))
++  // The normal launcher keeps its proactive WUX key warning. A positional
++  // forwarder stays silent and lets the selected title/core report any real
++  // decryption error instead of presenting an unrelated launcher modal.
++  if (!silentDirectForwarder && !cemu_hasConfiguredDiscKey("sdmc:/switch/cemu/keys.txt"))
+     modalMessageStatic("Disc key required", {
+       "Cemu/keys.txt does not contain a Wii U disc key.",
+       "WUX games cannot be decrypted until a valid key is added.",
+@@ -7335,12 +7350,94 @@ int main(int argc, char **argv){
+     userExit=true; running=false; return true;
+   };
+ 
+-  bool forwarderRequested=false,forwarderMatched=false;
+-  std::string forwarderKey;
+-  for(int ai=1; ai+1<argc; ai++) if(strcmp(argv[ai],"-g")==0){
++  auto prepareDirectForwarderGame=[&](const std::string &directPath) -> bool {
++    struct stat info{};
++    const bool exists=SwitchStorage::GetCachedSmbStat(directPath,&info)||stat(directPath.c_str(),&info)==0;
++    if(!exists) return false;
++    const bool isDirectory=S_ISDIR(info.st_mode);
++    struct stat codeInfo{};
++    const bool isGameDirectory=isDirectory&&stat((directPath+"/code").c_str(),&codeInfo)==0;
++    const size_t slash=directPath.find_last_of("/\\");
++    const std::string file=slash==std::string::npos?directPath:directPath.substr(slash+1);
++    if(!isGameDirectory&&(isDirectory||!hasGameExt(file.c_str()))) return false;
++
++    Game game;
++    game.file=file;
++    game.path=directPath;
++    game.storageId=usbStableIdForPath(directPath);
++    game.legacyKey=makeGameKey(game.file,directPath);
++    game.key=game.legacyKey;
++    game.added=(long long)info.st_mtime;
++    game.modified=game.added;
++    game.fileSize=(long long)info.st_size;
++
++    if(!isDirectory){
++      const char *cached=storeGet(g_containerTitles,game.legacyKey.c_str(),"");
++      long long size=0,mtime=0; unsigned long long id=0,fingerprint=0; int consumed=0;
++      const int parsed=sscanf(cached,"%lld,%lld,%llx,%llx%n",&size,&mtime,&id,&fingerprint,&consumed);
++      if(parsed>=3&&cached[consumed]==0&&size==game.fileSize&&mtime==game.modified&&(id>>48)==0x0005){
++        game.titleId=(uint64_t)id;
++        if(parsed==4) game.fingerprint=(uint64_t)fingerprint;
++      }
++    }
++
++    auto titleCache=cemu_loadTitleCache(std::string(DATA_DIR)+"/title_list_cache.xml");
++    if(!game.titleId) game.titleId=cemu_resolveBaseTitleId(directPath,titleCache,&game.titleIdError);
++    if(!isDirectory&&!game.fingerprint) game.fingerprint=fingerprintGameFile(directPath,info);
++    if(isDirectory&&!game.fingerprint) game.fingerprint=fingerprintGameDirectory(directPath,game.titleId);
++
++    Store refreshedIdentities=g_gameIdentities;
++    std::unordered_set<std::string> usedIdentities,reservedIds,reservedCanonicalPaths;
++    for(const KV &entry:refreshedIdentities.kv){
++      GameIdentityRecord record;
++      if(!parseIdentityRecord(entry,record)||record.retired) continue;
++      reservedIds.insert(record.key);
++      if(!record.canonicalPath.empty()&&identityPathExists(record)) reservedCanonicalPaths.insert(record.canonicalPath);
++    }
++    const std::string canonical=canonicalGamePath(directPath);
++    game.key=choosePersistentGameKey(refreshedIdentities,refreshedIdentities,usedIdentities,
++                                      reservedIds,reservedCanonicalPaths,
++                                      game.titleId,game.fingerprint,
++                                      identityFormat(directPath,isDirectory),canonical,directPath);
++    g_gameIdentities=std::move(refreshedIdentities);
++    storeSave(g_gameIdentities,GAME_IDENTITIES_INI);
++    migrateGameIdentity(game);
++
++    const char *custom=storeGet(g_titles,game.key.c_str(),"");
++    if(!custom[0]) custom=storeGet(g_titles,game.legacyKey.c_str(),"");
++    game.title=custom[0]?custom:cleanTitle(game.file);
++    game.region=detectRegion(game.file);
++    const char *played=storeGet(g_recent,game.key.c_str(),"");
++    if(!played[0]) played=storeGet(g_recent,game.legacyKey.c_str(),"0");
++    game.played=atoll(played);
++    game.hasCfg=gameFileExists(GAMECFG_DIR,game,".ini")||
++                regularFileExists(std::string(GAMECFG_DIR)+"/"+game.legacyKey+".ini");
++
++    if(!isDirectory&&game.titleId){
++      char cached[128];
++      snprintf(cached,sizeof(cached),"%lld,%lld,%016llx,%016llx",game.fileSize,game.modified,
++               (unsigned long long)game.titleId,(unsigned long long)game.fingerprint);
++      storeSet(g_containerTitles,game.key.c_str(),cached);
++      storeSet(g_containerTitles,game.legacyKey.c_str(),cached);
++      storeSave(g_containerTitles,CONTAINER_TITLES_INI);
++    }
++    selectGame(game);
++    return true;
++  };
++
++  bool forwarderRequested=silentDirectForwarder;
++  bool forwarderMatched=false;
++  bool forwarderDirectPath=silentDirectForwarder;
++  std::string forwarderKey=positionalForwarderPath;
++  auto findForwarderGame=[&]() -> Game* { return findGameByKey(forwarderKey); };
++
++  if(forwarderDirectPath) forwarderMatched=prepareDirectForwarderGame(forwarderKey);
++
++  // Preserve NaGaa's built-in -g <gameKey> behavior unchanged.
++  if(!forwarderRequested) for(int ai=1; ai+1<argc; ai++) if(strcmp(argv[ai],"-g")==0){
+     forwarderRequested=true;
+     forwarderKey=argv[ai+1];
+-    if (Game *game = findGameByKey(forwarderKey)){ selectGame(*game); forwarderMatched=true; }
++    if(Game *game=findForwarderGame()){ selectGame(*game); forwarderMatched=true; }
+     break;
+   }
+   if(!forwarderRequested&&g_griddbReady&&
+@@ -7364,10 +7461,12 @@ int main(int argc, char **argv){
+       usbGeneration=usbSnapshot.generation;
+       gamePaths=loadGameSources();
+       refreshConfiguredUsbSources(gamePaths);
+-      std::vector<std::string> mountedSources;
+-      for(const std::string &source:gamePaths)
+-        if(isUsbStoragePath(source)||source.rfind("cemusmb_",0)==0) mountedSources.push_back(source);
+-      pendingMountedSources=std::move(mountedSources);
++      if(!silentDirectForwarder){
++        std::vector<std::string> mountedSources;
++        for(const std::string &source:gamePaths)
++          if(isUsbStoragePath(source)||source.rfind("cemusmb_",0)==0) mountedSources.push_back(source);
++        pendingMountedSources=std::move(mountedSources);
++      }
+     }
+     if(hasUsbSource&&storageIntegrated){
+       const Uint32 now=SDL_GetTicks();
+@@ -7404,13 +7503,17 @@ int main(int argc, char **argv){
+           const std::string id=usbStableIdForPath(source);
+           if(!id.empty()&&needsScan.count(id)) changedUsbSources.push_back(source);
+         }
+-        if(!changedUsbSources.empty()) pendingMountedSources=std::move(changedUsbSources);
++        if(!silentDirectForwarder&&!changedUsbSources.empty()) pendingMountedSources=std::move(changedUsbSources);
+         sel=0;
+         if(!selected.empty()) for(size_t index=0;index<g_libraryView.size();index++) if(g_libraryView[index]->key==selected){ sel=(int)index; break; }
+         top=0;
+-        if(forwarderPending) if(Game *game=findGameByKey(forwarderKey)){
+-          selectGame(*game);
+-          forwarderPending=false;
++        if(forwarderPending){
++          if(forwarderDirectPath){
++            if(prepareDirectForwarderGame(forwarderKey)) forwarderPending=false;
++          } else if(Game *game=findForwarderGame()){
++            selectGame(*game);
++            forwarderPending=false;
++          }
+         }
+       }
+       if(forwarderPending&&SDL_TICKS_PASSED(now,forwarderDeadline)){
+@@ -7430,13 +7533,16 @@ int main(int argc, char **argv){
+         }
+       }
+       if(!running) break;
+-      if(Game *game=findGameByKey(forwarderKey)){
++      if(forwarderDirectPath){
++        if(prepareDirectForwarderGame(forwarderKey)){ forwarderPending=false; break; }
++      } else if(Game *game=findForwarderGame()){
+         selectGame(*game);
+         forwarderPending=false;
+         break;
+       }
+-      renderUsbForwarderWait();
+-    waitForNextUiFrame();
++      // Raw positional forwarders wait without presenting launcher UI.
++      if(!forwarderDirectPath) renderUsbForwarderWait();
++      waitForNextUiFrame();
+       continue;
+     }
+     GLay L=gridLayout();
