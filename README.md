@@ -1,66 +1,35 @@
-# **Cemu - Wii U emulator**
+# Cemu-nx – WillsitoGG tuning
 
-[![Build Process](https://github.com/cemu-project/Cemu/actions/workflows/build.yml/badge.svg)](https://github.com/cemu-project/Cemu/actions/workflows/build.yml)
-[![Discord](https://img.shields.io/discord/286429969104764928?label=Cemu&logo=discord&logoColor=FFFFFF)](https://discord.gg/5psYsup)
-[![Matrix Server](https://img.shields.io/matrix/cemu:cemu.info?server_fqdn=matrix.cemu.info&label=cemu:cemu.info&logo=matrix&logoColor=FFFFFF)](https://matrix.to/#/#cemu:cemu.info)
+This fork keeps NaGaa95/Cemu-nx clean on `main` and stores WillsitoGG-specific tuning work on `willsito-tuning`.
 
-This is the code repository of Cemu, a Wii U emulator that is able to run most Wii U games and homebrew in a playable state.
-It's written in C/C++ and is being actively developed with new features and fixes.
+## Branch model
 
-Cemu is currently only available for 64-bit Windows, Linux & macOS devices.
+- `main`: exact upstream tracking branch. Do not place tuning files, archives or migration helpers here.
+- `fix/direct-forwarder`: clean upstream-facing source change used by PR #5.
+- `willsito-tuning`: permanent tuning branch with source, reproducible validation, release notes, hashes and historical archive.
 
-### Links:
- - [Open Source Announcement](https://www.reddit.com/r/cemu/comments/wwa22c/cemu_20_announcement_linux_builds_opensource_and/)
- - [Official Website](https://cemu.info)
- - [Compatibility List/Wiki](https://wiki.cemu.info/wiki/Main_Page)
- - [Official Subreddit](https://reddit.com/r/Cemu)
- - [Official Discord](https://discord.gg/5psYsup)
- - [Official Matrix Server](https://matrix.to/#/#cemu:cemu.info)
- - [Setup Guide](https://cemu.cfw.guide)
+## Current tuning
 
-#### Other relevant repositories:
- - [Cemu-Language](https://github.com/cemu-project/Cemu-Language)
- - [Cemu's Community Graphic Packs](https://github.com/cemu-project/cemu_graphic_packs)
+**Cemu-nx 1.1.3 – Direct Forwarder Fix v2**
 
-## Download
+- Upstream base: `9e8dcba0fefae6f5b98722c7505327bb4e325019`
+- Upstream-facing commit: `8e31e7d615e4f43d4e765ba9ff56fee4904f1d93`
+- Tuned source: `switch_launcher/source/main.cpp`
+- Exact tuned source blob: `8a40edb75434fbef0ed8a854264b77ab11d049dd`
+- Historical hardware-tested/published NRO SHA-256: `36488988b8b814b865243c6f27258374685a0ee88a53a7cddfdee5b9842a3ece`
 
-You can download the latest Cemu releases for Windows, Linux and Mac from the [GitHub Releases](https://github.com/cemu-project/Cemu/releases/). For Linux you can also find Cemu on [flathub](https://flathub.org/apps/info.cemu.Cemu).
+The positional `argv[1]` path is detected before SDL/video initialization and follows a fully headless launch path to the embedded `cemu_core.nro`. The normal launcher and NaGaa's `-g <gameKey>` behavior remain unchanged.
 
-On Windows, Cemu is available both as an installer and in a portable format, where no installation is required besides extracting it in a safe place.
+## Historical final revision
 
-The native macOS build is currently purely experimental and should not be considered stable or ready for issue-free gameplay. There are also known issues with degraded performance due to the use of MoltenVK and Rosetta for ARM Macs. We appreciate your patience while we improve Cemu for macOS.
+`Archive/Cemu-nx 1.1.3 - Direct Forwarder Fix_v1/` preserves the superseded v1 release. The exact historical NRO is migrated byte-for-byte from the previous tuning repository; it is not recreated or substituted by a rebuild.
 
-Pre-2.0 releases can be found on Cemu's [changelog page](https://cemu.info/changelog.html).
+## Validation policy
 
-## Build Instructions
+The Release asset and archived v1 binary are preserved exactly. Rebuilds are used only as independent reproducibility/structure checks and their hashes are recorded separately from hardware-tested/published hashes.
 
-To compile Cemu yourself on Windows, Linux or macOS, view [BUILD.md](/BUILD.md).
+The official embedded `cemu_core.nro` must remain byte-for-byte identical to Cemu-nx 1.1.3.
 
-## Issues
+## Release policy
 
-Issues with the emulator should be filed using [GitHub Issues](https://github.com/cemu-project/Cemu/issues).  
-The old bug tracker can be found at [bugs.cemu.info](https://bugs.cemu.info) and still contains relevant issues and feature suggestions.
-
-## Contributing
-
-Pull requests are very welcome. For easier coordination you can visit the developer discussion channel on [Discord](https://discord.gg/5psYsup) or alternatively the [Matrix Server](https://matrix.to/#/#cemu:cemu.info).
-Before submitting a pull request, please read and follow our code style guidelines listed in [CODING_STYLE.md](/CODING_STYLE.md).
-
-If coding isn't your thing, testing games and making detailed bug reports or updating the (usually outdated) compatibility wiki is also appreciated!
-
-Questions about Cemu's software architecture can also be answered on Discord (or through the Matrix bridge).
-
-#### AI generated contributions:
-
-We ask that all code submitted is written and understood by a human. You can use AI for planning, designing, reviewing and for asking questions about the codebase, but the code itself needs to be written by you. As a small exception you can use intellisense-style AI code autocompletion for pure boilerplate code as long as it's only a small part of your submission. To further clarify, when we ask for "human written" that excludes letting an AI write the code and then paraphrasing it. In other words, we are asking for human effort.
-
-Why this policy exists:
-
-We have relatively low reviewing capacity and requiring human-written code increases the quality and trustworthyness of submitted pull requests. There are also general concerns with AI usage in emulation:
-- LLMs tend to make up solutions that work on the surface but are generally not accurate in the emulation sense
-- There is evidence that LLMs have been trained on leaked proprietary SDKs and we cannot verify the origin of the knowledge. This is especially a problem for core emulation logic
-
-Please keep these points in mind when contributing to Cemu. Contributions that do not follow this policy may be rejected.
-
-## License
-Cemu is licensed under [Mozilla Public License 2.0](/LICENSE.txt). Exempt from this are all files in the dependencies directory for which the licenses of the original code apply as well as some individual files in the src folder, as specified in those file headers respectively.
+Only the current final WillsitoGG tuning should remain visible under Releases. Superseded final versions belong under `Archive/` with provenance and checksums. Temporary, failed or experimental build output must not remain in the permanent branch.

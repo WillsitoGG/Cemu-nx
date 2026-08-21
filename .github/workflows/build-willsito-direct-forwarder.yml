@@ -1,0 +1,27 @@
+name: Validate WillsitoGG Cemu Direct Forwarder Fix v2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:20260219
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: willsito-tuning
+          fetch-depth: 0
+      - name: Rebuild and validate v2
+        shell: bash
+        run: bash .github/scripts/build-willsito-direct-forwarder.sh
+      - name: Upload validation rebuild
+        uses: actions/upload-artifact@v4
+        with:
+          name: cemu-1.1.3-direct-forwarder-fix-v2-validation
+          path: cemu-fix-build-output/
+          if-no-files-found: error
