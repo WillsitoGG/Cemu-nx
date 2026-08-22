@@ -1,14 +1,29 @@
-Current release historical hardware-tested/published NRO SHA-256:
+Current release hardware-tested/published NRO SHA-256:
 36488988b8b814b865243c6f27258374685a0ee88a53a7cddfdee5b9842a3ece  Cemu.nro
 
-Historical v1 exact NRO SHA-256:
-ecf28315b453617b7d8c8eff89c728f162f62aaf88814ae210f639ece7095456  Archive/Cemu-nx 1.1.3 - Direct Forwarder Fix_v1/Cemu.nro
+Current release reproducibility status:
+EXACT_MATCH - app-specific rebuild produced the same SHA-256 as the published v2 binary.
+
+Historical v1 published NRO identity:
+ecf28315b453617b7d8c8eff89c728f162f62aaf88814ae210f639ece7095456  Cemu.nro
+
+Historical v1 binary availability:
+UNRECOVERED - no replacement rebuild is stored or represented as the authentic historical binary.
+
+Historical v1 final reproduction SHA-256:
+94d1e8cf5be07fe18614ec01760dca8fa047bb0c2ecb3946b4f47f5bd3a3880a  independently rebuilt Cemu.nro
+
+Historical v1 reproduction status:
+NON_MATCH - the rebuild above does not equal the historical published SHA-256.
 
 Current tuned source blob:
 8a40edb75434fbef0ed8a854264b77ab11d049dd  switch_launcher/source/main.cpp
 
 Historical v1 source blob:
-1ab55ef775dc44fb0897f6720ffcc945d134ca1d  Archive/Cemu-nx 1.1.3 - Direct Forwarder Fix_v1/source/Cemu_main_patched.cpp
+1ab55ef775dc44fb0897f6720ffcc945d134ca1d  reconstructed from upstream base plus archived exact patch
+
+Historical v1 source patch blob:
+5b219fce00d0b52384f8521b462d7daf3c2052ec  Archive/Cemu-nx 1.1.3 - Direct Forwarder Fix_v1/repro/Cemu-1.1.3-DirectForwarderFix-v1.patch
 
 Official Cemu-nx 1.1.3 NRO SHA-256:
 638cf4832dfd20ec5fe5783faabfd19692904323f670c3fb318715b82c90d3d0
