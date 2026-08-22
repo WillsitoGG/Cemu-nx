@@ -11,13 +11,10 @@ import sys
 src=Path(sys.argv[1]).read_text()
 out=Path(sys.argv[2])
 
+# Preserve the original historical absolute work path exactly. Cemu builds are
+# path-sensitive, and v1 was originally built in /work/cemu-direct-forwarder-fix.
 src=src.replace('OUT="${OUT:-$ROOT/cemu-fix-build-output}"',
                 'OUT="${OUT:-$ROOT/cemu-v1-build-output}"',1)
-src=src.replace('WORK="${WORK:-/work/cemu-direct-forwarder-fix}"',
-                'WORK="${WORK:-/work/cemu-direct-forwarder-v1}"',1)
-# The permanent v2 builder embeds its work path in Python/CMake snippets too.
-# Rewrite every remaining embedded occurrence so the v1 reproduction is self-consistent.
-src=src.replace('/work/cemu-direct-forwarder-fix','/work/cemu-direct-forwarder-v1')
 src=src.replace('EXPECTED_SOURCE_BLOB="8a40edb75434fbef0ed8a854264b77ab11d049dd"',
                 'EXPECTED_SOURCE_BLOB="1ab55ef775dc44fb0897f6720ffcc945d134ca1d"',1)
 
@@ -38,7 +35,7 @@ src=src.replace("grep -Eq 'DisplayVersion:[[:space:]]+1\\.1\\.3-v2' \"$OUT/NRO_M
 
 prov_start=src.index('cat > "$OUT/PROVENANCE.txt" <<EOF\n')
 prov_end=src.index('\nEOF\ncat "$OUT/REBUILT_SHA256SUMS.txt"',prov_start)+5
-provenance='''cat > "$OUT/PROVENANCE.txt" <<EOF\nCemu-nx 1.1.3 – Direct Forwarder Fix_v1 historical reproducibility build\nUpstream source commit: $SOURCE_COMMIT\nExact historical source blob: $SOURCE_BLOB\nHistorical patch: Archive/Cemu-nx 1.1.3 - Direct Forwarder Fix_v1/repro/Cemu-1.1.3-DirectForwarderFix-v1.patch\nOfficial Cemu-nx 1.1.3 NRO SHA-256: $EXPECTED_OFFICIAL_NRO_SHA256\nOfficial embedded cemu_core.nro SHA-256: $EXPECTED_CORE_SHA256\nNACP DisplayVersion: 1.1.3\nExpected historical published NRO SHA-256: ecf28315b453617b7d8c8eff89c728f162f62aaf88814ae210f639ece7095456\nEOF\n'''
+provenance='''cat > "$OUT/PROVENANCE.txt" <<EOF\nCemu-nx 1.1.3 – Direct Forwarder Fix_v1 historical reproducibility build\nUpstream source commit: $SOURCE_COMMIT\nExact historical source blob: $SOURCE_BLOB\nHistorical patch: Archive/Cemu-nx 1.1.3 - Direct Forwarder Fix_v1/repro/Cemu-1.1.3-DirectForwarderFix-v1.patch\nHistorical absolute work path: /work/cemu-direct-forwarder-fix\nOfficial Cemu-nx 1.1.3 NRO SHA-256: $EXPECTED_OFFICIAL_NRO_SHA256\nOfficial embedded cemu_core.nro SHA-256: $EXPECTED_CORE_SHA256\nNACP DisplayVersion: 1.1.3\nExpected historical published NRO SHA-256: ecf28315b453617b7d8c8eff89c728f162f62aaf88814ae210f639ece7095456\nEOF\n'''
 src=src[:prov_start]+provenance+src[prov_end:]
 
 needle='cat "$OUT/REBUILT_SHA256SUMS.txt"\n'
