@@ -25,8 +25,11 @@ Do not refactor or alter that source while claiming to reproduce the tested tuni
 ## Binary provenance
 
 - Current hardware-tested/published v2 NRO SHA-256: `36488988b8b814b865243c6f27258374685a0ee88a53a7cddfdee5b9842a3ece`.
-- Historical v1 NRO SHA-256: `ecf28315b453617b7d8c8eff89c728f162f62aaf88814ae210f639ece7095456`.
-- Never replace those identities with a fresh rebuild and describe it as the same binary.
+- Historical v1 published NRO SHA-256: `ecf28315b453617b7d8c8eff89c728f162f62aaf88814ae210f639ece7095456`.
+- Historical v1 exact source blob: `1ab55ef775dc44fb0897f6720ffcc945d134ca1d`.
+- Historical v1 final reproduction SHA-256: `94d1e8cf5be07fe18614ec01760dca8fa047bb0c2ecb3946b4f47f5bd3a3880a`.
+- The v1 reproduction is **not** byte-identical to the published v1 binary and must never be stored, released or described as that historical binary.
+- Never replace a historical identity with a fresh rebuild unless the SHA-256 proves exact byte identity.
 - Fresh rebuilds are validation artifacts and must have their own hashes.
 
 ## Embedded core rule
@@ -37,7 +40,9 @@ The official Cemu-nx 1.1.3 `cemu_core.nro` must remain byte-for-byte identical. 
 
 ## Historical archive
 
-Superseded final releases belong under `Archive/`. Preserve exact recoverable binaries, exact source, provenance and SHA-256. Never fabricate an unrecoverable historical binary.
+Superseded final releases belong under `Archive/`. Preserve exact recoverable binaries, exact source/patch provenance and SHA-256 identities. Never fabricate an unrecoverable historical binary.
+
+For Cemu v1 specifically, preserve the exact source patch/reproduction recipe and the known historical SHA-256, but do not add a `Cemu.nro` unless a future recovery is proven byte-identical to `ecf28315b453617b7d8c8eff89c728f162f62aaf88814ae210f639ece7095456`.
 
 ## Releases
 
