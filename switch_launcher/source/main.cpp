@@ -6851,10 +6851,16 @@ static bool ensureEmu() {
     written += (long long)n;
     int pct = (int)((unsigned __int128)written * 100 / sourceStat.st_size);
     if (pct != lastPct) {
-      if(!beginUiFrame()){ ok=false; break; }
-      SDL_Event event; while(pollUiEvent(event)) {}
-      if(g_exitRequested){ ok=false; break; }
-      drawSetupProgress(pct, "Preparing emulator..."); lastPct = pct;
+      // A positional v2 forwarder reaches ensureEmu() before SDL/video is
+      // initialized. Copy/verify the embedded core completely headlessly in
+      // that case; the normal launcher keeps the authored progress screen.
+      if(g_sdlReady){
+        if(!beginUiFrame()){ ok=false; break; }
+        SDL_Event event; while(pollUiEvent(event)) {}
+        if(g_exitRequested){ ok=false; break; }
+        drawSetupProgress(pct, "Preparing emulator...");
+      }
+      lastPct = pct;
     }
   }
   if (ferror(in)) ok = false;
@@ -7183,11 +7189,231 @@ int main(int argc, char **argv){
     g_forwarderSelfPath=argv[0];
     setLauncherPathFromArg(argv[0]);
   }
+
+  // Direct NSP forwarders are identified before SDL/video exists.  The v1
+  // compatibility path was silent only after the launcher had already created
+  // a fullscreen SDL window, which still produced a visible intermediate
+  // launcher phase.  v2 takes a fully headless path from argv[1] to chainload.
+  std::string positionalForwarderPathEarly;
+  if(argc>=2 && argv[1] && argv[1][0] && argv[1][0]!='-')
+    positionalForwarderPathEarly=normalizeLocationPath(argv[1]);
+
   std::string updateRecoveryError;
   const bool updateRecoveryOk=LauncherUpdate_RecoverInstallation(g_launcherNroPath,updateRecoveryError);
   if (R_FAILED(romfsInit())) return 1;
   g_romfsReady = true;
   detectSystemLanguage();
+
+  if(!positionalForwarderPathEarly.empty()){
+    const char *directories[] = {
+      "sdmc:/switch", DATA_DIR, EMU_HOST_DIR, COVERS_DIR, GAMECFG_DIR, DEF_GAMEDIR,
+      GAMEPROFILES_DIR, GRAPHICPACKS_DIR, LSFG_DIR, "sdmc:/switch/cemu/cache",
+      "sdmc:/switch/cemu/install", "sdmc:/switch/cemu/mlc01"
+    };
+    for(const char *directory : directories){
+      if(!ensureDirectory(directory)){
+        cleanupLauncher();
+        return 1;
+      }
+    }
+    cleanupLegacyEmuHosts();
+
+    // Load exactly the persistent state required to reproduce a normal
+    // per-game launch.  No launcher localization, audio, image, font, window,
+    // renderer, cover worker or grid scan is started on this path.
+    struct stat bst{};
+    const bool firstRunHeadless=(stat(LAUNCHER_INI,&bst)!=0);
+    storeLoad(g_global,LAUNCHER_INI);
+    storeLoad(g_titles,TITLES_INI);
+    storeLoad(g_recent,RECENT_INI);
+    storeLoad(g_containerTitles,CONTAINER_TITLES_INI);
+    storeLoad(g_gameIdentities,GAME_IDENTITIES_INI);
+    loadLibraryOrganization();
+    { int sm=atoi(storeGet(g_global,"Wrapper/SortMode","0")); if(sm>=0&&sm<SORT_COUNT) g_sort=sm; }
+    if(firstRunHeadless){
+      g_active=&g_global;
+      saveGameSources({DEF_GAMEDIR});
+      storeSet(g_global,"Wrapper/SteamGridDBKey","");
+      storeSet(g_global,"Wrapper/UiSounds","true");
+      storeSet(g_global,"Wrapper/Theme","homebrew");
+      storeSet(g_global,"Wrapper/Language","system");
+      storeSet(g_global,"Wrapper/Renderer","vk");
+      storeSet(g_global,"console_language","-1");
+      storeSet(g_global,"Wrapper/GridColumns","5");
+      storeSet(g_global,"Wrapper/GridRows","2");
+      storeSet(g_global,"Wrapper/ShowGameTitles","true");
+      storeSet(g_global,"Wrapper/ShowRegionFlags","true");
+      storeSet(g_global,"Wrapper/ShowCustomSettingsBadges","true");
+      storeSet(g_global,"Wrapper/UiAnimations","true");
+      storeSet(g_global,"Wrapper/CheckUpdatesAtBoot","true");
+      storeSet(g_global,"Wrapper/InstalledReleaseTag",LauncherUpdate_BuiltReleaseTag());
+      commitAll();
+      storeSave(g_global,LAUNCHER_INI);
+    }
+
+    const std::vector<std::string> gamePathsHeadless=loadGameSources();
+    const bool directUsesUsbHeadless=isUsbStoragePath(positionalForwarderPathEarly);
+    if(directUsesUsbHeadless){
+      SwitchStorage::SetUsbStatusCallback(nullptr,nullptr);
+      SwitchStorage::InitializeUsb();
+    }
+
+    auto resolveDirectGameHeadless=[&](Game &outGame)->bool{
+      const std::string &directPath=positionalForwarderPathEarly;
+      struct stat info{};
+      const bool exists=SwitchStorage::GetCachedSmbStat(directPath,&info)||stat(directPath.c_str(),&info)==0;
+      if(!exists) return false;
+      const bool isDirectory=S_ISDIR(info.st_mode);
+      struct stat codeInfo{};
+      const bool isGameDirectory=isDirectory&&stat((directPath+"/code").c_str(),&codeInfo)==0;
+      const size_t slash=directPath.find_last_of("/\\");
+      const std::string file=slash==std::string::npos?directPath:directPath.substr(slash+1);
+      if(!isGameDirectory&&(isDirectory||!hasGameExt(file.c_str()))) return false;
+
+      Game game;
+      game.file=file;
+      game.path=directPath;
+      game.storageId=usbStableIdForPath(directPath);
+      game.legacyKey=makeGameKey(game.file,directPath);
+      game.key=game.legacyKey;
+      game.added=(long long)info.st_mtime;
+      game.modified=game.added;
+      game.fileSize=(long long)info.st_size;
+
+      if(!isDirectory){
+        const char *cached=storeGet(g_containerTitles,game.legacyKey.c_str(),"");
+        long long size=0,mtime=0; unsigned long long id=0,fingerprint=0; int consumed=0;
+        const int parsed=sscanf(cached,"%lld,%lld,%llx,%llx%n",&size,&mtime,&id,&fingerprint,&consumed);
+        if(parsed>=3&&cached[consumed]==0&&size==game.fileSize&&mtime==game.modified&&(id>>48)==0x0005){
+          game.titleId=(uint64_t)id;
+          if(parsed==4) game.fingerprint=(uint64_t)fingerprint;
+        }
+      }
+
+      auto titleCache=cemu_loadTitleCache(std::string(DATA_DIR)+"/title_list_cache.xml");
+      if(!game.titleId) game.titleId=cemu_resolveBaseTitleId(directPath,titleCache,&game.titleIdError);
+      if(!isDirectory&&!game.fingerprint) game.fingerprint=fingerprintGameFile(directPath,info);
+      if(isDirectory&&!game.fingerprint) game.fingerprint=fingerprintGameDirectory(directPath,game.titleId);
+
+      Store refreshedIdentities=g_gameIdentities;
+      std::unordered_set<std::string> usedIdentities,reservedIds,reservedCanonicalPaths;
+      for(const KV &entry:refreshedIdentities.kv){
+        GameIdentityRecord record;
+        if(!parseIdentityRecord(entry,record)||record.retired) continue;
+        reservedIds.insert(record.key);
+        if(!record.canonicalPath.empty()&&identityPathExists(record)) reservedCanonicalPaths.insert(record.canonicalPath);
+      }
+      const std::string canonical=canonicalGamePath(directPath);
+      game.key=choosePersistentGameKey(refreshedIdentities,refreshedIdentities,usedIdentities,
+                                        reservedIds,reservedCanonicalPaths,
+                                        game.titleId,game.fingerprint,
+                                        identityFormat(directPath,isDirectory),canonical,directPath);
+      g_gameIdentities=std::move(refreshedIdentities);
+      storeSave(g_gameIdentities,GAME_IDENTITIES_INI);
+      migrateGameIdentity(game);
+
+      const char *custom=storeGet(g_titles,game.key.c_str(),"");
+      if(!custom[0]) custom=storeGet(g_titles,game.legacyKey.c_str(),"");
+      game.title=custom[0]?custom:cleanTitle(game.file);
+      game.region=detectRegion(game.file);
+      const char *played=storeGet(g_recent,game.key.c_str(),"");
+      if(!played[0]) played=storeGet(g_recent,game.legacyKey.c_str(),"0");
+      game.played=atoll(played);
+      game.hasCfg=gameFileExists(GAMECFG_DIR,game,".ini")||
+                  regularFileExists(std::string(GAMECFG_DIR)+"/"+game.legacyKey+".ini");
+
+      if(!isDirectory&&game.titleId){
+        char cached[128];
+        snprintf(cached,sizeof(cached),"%lld,%lld,%016llx,%016llx",game.fileSize,game.modified,
+                 (unsigned long long)game.titleId,(unsigned long long)game.fingerprint);
+        storeSet(g_containerTitles,game.key.c_str(),cached);
+        storeSet(g_containerTitles,game.legacyKey.c_str(),cached);
+        storeSave(g_containerTitles,CONTAINER_TITLES_INI);
+      }
+      outGame=std::move(game);
+      return true;
+    };
+
+    Game directGameHeadless;
+    bool directMatchedHeadless=false;
+    const int directAttemptsHeadless=directUsesUsbHeadless?100:1;
+    for(int attempt=0;attempt<directAttemptsHeadless;attempt++){
+      if(resolveDirectGameHeadless(directGameHeadless)){
+        directMatchedHeadless=true;
+        break;
+      }
+      if(directUsesUsbHeadless) svcSleepThread(100000000LL);
+    }
+    if(!directMatchedHeadless){
+      cleanupLauncher();
+      return 1;
+    }
+
+    recordPlayed(directGameHeadless);
+    const std::string launchKeyHeadless=directGameHeadless.key;
+    const std::string launchPathHeadless=directGameHeadless.path;
+    const uint64_t launchTitleIdHeadless=directGameHeadless.titleId;
+
+    g_active=&g_global;
+    commitAll();
+    storeSave(g_global,LAUNCHER_INI);
+    storeSave(g_recent,RECENT_INI);
+
+    if(!envHasNextLoad()){
+      cleanupLauncher();
+      return 1;
+    }
+
+    std::vector<CemuKV> eff=buildEffectiveSettings(launchKeyHeadless);
+    const char *configuredRenderer=cemuKVGet(eff,"Wrapper/Renderer","vk");
+    const std::string renderer=!strcmp(configuredRenderer,"gl")?"gl":
+                               !strcmp(configuredRenderer,"zink")?"zink":"vk";
+    const bool haveEmu=ensureEmu();
+    appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+
+    std::vector<CemuGraphicPack> enabledPacks;
+    bool configOk=haveEmu&&readEnabledPacks(enabledPacks);
+    if(configOk) configOk=cemu_writeSettingsXml(SETTINGS_XML,eff,gamePathsHeadless,enabledPacks);
+    if(configOk) configOk=writeInputIni(eff);
+    if(configOk&&launchTitleIdHeadless)
+      configOk=cemu_writeGameProfile(GAMEPROFILES_DIR,launchTitleIdHeadless,
+                                     directGameHeadless.title.c_str(),eff);
+    if(configOk){
+      std::string handoff;
+      bool lsfgPrepared=renderer=="vk"&&
+                        !strcmp(cemuKVGet(eff,"Wrapper/LSFGEnabled","false"),"true");
+      if(lsfgPrepared&&!regularFileExists(LSFG_DLL_FILE)) lsfgPrepared=false;
+      configOk=appendHandoffValue(handoff,"timer_shift",cemuKVGet(eff,"TimerShiftFactor","3"))&&
+               appendHandoffValue(handoff,"triple_buffer",cemuKVGet(eff,"TripleBuffer","1"))&&
+               appendHandoffValue(handoff,"cpu_mode",cemuKVGet(eff,"cpuMode","3"))&&
+               appendHandoffValue(handoff,"renderer",renderer)&&
+               appendHandoffValue(handoff,"gamepad_layout",cemuKVGet(eff,"GamePadLayout","off"))&&
+               appendHandoffValue(handoff,"lsfg_enabled",lsfgPrepared?"true":"false")&&
+               appendHandoffValue(handoff,"lsfg_flow_scale",cemuKVGet(eff,"Wrapper/LSFGFlowScale","0.25"))&&
+               appendHandoffValue(handoff,"lsfg_performance",cemuKVGet(eff,"Wrapper/LSFGPerformance","true"))&&
+               appendHandoffValue(handoff,"usb_skylanders",cemuKVGet(eff,"UsbSkylanders","false"))&&
+               appendHandoffValue(handoff,"usb_infinity",cemuKVGet(eff,"UsbInfinity","false"))&&
+               appendHandoffValue(handoff,"usb_dimensions",cemuKVGet(eff,"UsbDimensions","false"));
+      char gameId[32]{};
+      if(configOk&&!launchPathHeadless.empty())
+        configOk=appendHandoffValue(handoff,"game",launchPathHeadless);
+      else if(configOk&&launchTitleIdHeadless){
+        snprintf(gameId,sizeof(gameId),"id:%016llx",(unsigned long long)launchTitleIdHeadless);
+        configOk=appendHandoffValue(handoff,"game",gameId);
+      }
+      if(configOk) configOk=writeAtomicText(LAUNCH_HANDOFF,handoff);
+    }
+    appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+    if(!configOk) remove(LAUNCH_HANDOFF);
+
+    // cleanupLauncher() is safe here because none of the SDL/UI readiness flags
+    // were ever set.  The next executable is armed only after all files are
+    // committed, so no Cemu launcher frame is presented before cemu_core.nro.
+    cleanupLauncher();
+    if(configOk) envSetNextLoad(EMU_NRO_DST,EMU_NRO_DST);
+    return configOk?0:1;
+  }
+
   SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,"1");
   SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,"linear");
   if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMECONTROLLER|SDL_INIT_AUDIO)!=0) return startupFailure("SDL initialization failed.");
@@ -7285,14 +7511,26 @@ int main(int argc, char **argv){
   LauncherLocalization::Initialize(storeGet(g_global,"Wrapper/Language","system"));
   applyLauncherAppearance();
   uiAudioSetEnabled(strcmp(storeGet(g_global,"Wrapper/UiSounds","true"),"false")!=0);
+
+  // Standard NSP forwarders pass the selected Wii U title path as argv[1].
+  // Detect this before the normal library/storage pipeline so the direct path
+  // can be resolved without ever presenting the launcher grid or wait screen.
+  std::string positionalForwarderPath;
+  if(argc>=2&&argv[1]&&argv[1][0]&&argv[1][0]!='-')
+    positionalForwarderPath=normalizeLocationPath(argv[1]);
+  const bool silentDirectForwarder=!positionalForwarderPath.empty();
+
   startCoverDecodeWorker();
   std::vector<std::string> gamePaths=loadGameSources();
   bool hasUsbSource=hasConfiguredUsbSource(gamePaths)||hasConfiguredUsbBinding();
+  const bool directForwarderUsesUsb=silentDirectForwarder&&isUsbStoragePath(positionalForwarderPath);
+  if(directForwarderUsesUsb) hasUsbSource=true;
   std::atomic<bool> storageInitDone{false},storageInitCancel{false};
   std::thread storageInitWorker([&]{
     SwitchStorage::SetUsbStatusCallback(usbStatusWake,nullptr);
-    if(hasUsbSource&&!storageInitCancel.load()) SwitchStorage::InitializeUsb();
-    for(const auto &share:loadSmbSharesFromStore()){
+    const bool initializeUsb=(!silentDirectForwarder&&hasUsbSource)||directForwarderUsesUsb;
+    if(initializeUsb&&!storageInitCancel.load()) SwitchStorage::InitializeUsb();
+    if(!silentDirectForwarder) for(const auto &share:loadSmbSharesFromStore()){
       if(storageInitCancel.load()) break;
       if(share.autoMount){ std::string error; SwitchStorage::MountSmb(share,&error,&storageInitCancel); }
     }
@@ -7301,11 +7539,14 @@ int main(int argc, char **argv){
   });
   SwitchStorage::UsbSnapshot usbSnapshot;
   uint64_t usbGeneration=0;
-  startGameScan(gamePaths,true);
+  if(!silentDirectForwarder) startGameScan(gamePaths,true);
   bool storageIntegrated=false;
   Uint32 usbRefreshAt=0;
 
-  if (!cemu_hasConfiguredDiscKey("sdmc:/switch/cemu/keys.txt"))
+  // The normal launcher keeps its proactive WUX key warning. A positional
+  // forwarder stays silent and lets the selected title/core report any real
+  // decryption error instead of presenting an unrelated launcher modal.
+  if (!silentDirectForwarder && !cemu_hasConfiguredDiscKey("sdmc:/switch/cemu/keys.txt"))
     modalMessageStatic("Disc key required", {
       "Cemu/keys.txt does not contain a Wii U disc key.",
       "WUX games cannot be decrypted until a valid key is added.",
@@ -7335,12 +7576,94 @@ int main(int argc, char **argv){
     userExit=true; running=false; return true;
   };
 
-  bool forwarderRequested=false,forwarderMatched=false;
-  std::string forwarderKey;
-  for(int ai=1; ai+1<argc; ai++) if(strcmp(argv[ai],"-g")==0){
+  auto prepareDirectForwarderGame=[&](const std::string &directPath) -> bool {
+    struct stat info{};
+    const bool exists=SwitchStorage::GetCachedSmbStat(directPath,&info)||stat(directPath.c_str(),&info)==0;
+    if(!exists) return false;
+    const bool isDirectory=S_ISDIR(info.st_mode);
+    struct stat codeInfo{};
+    const bool isGameDirectory=isDirectory&&stat((directPath+"/code").c_str(),&codeInfo)==0;
+    const size_t slash=directPath.find_last_of("/\\");
+    const std::string file=slash==std::string::npos?directPath:directPath.substr(slash+1);
+    if(!isGameDirectory&&(isDirectory||!hasGameExt(file.c_str()))) return false;
+
+    Game game;
+    game.file=file;
+    game.path=directPath;
+    game.storageId=usbStableIdForPath(directPath);
+    game.legacyKey=makeGameKey(game.file,directPath);
+    game.key=game.legacyKey;
+    game.added=(long long)info.st_mtime;
+    game.modified=game.added;
+    game.fileSize=(long long)info.st_size;
+
+    if(!isDirectory){
+      const char *cached=storeGet(g_containerTitles,game.legacyKey.c_str(),"");
+      long long size=0,mtime=0; unsigned long long id=0,fingerprint=0; int consumed=0;
+      const int parsed=sscanf(cached,"%lld,%lld,%llx,%llx%n",&size,&mtime,&id,&fingerprint,&consumed);
+      if(parsed>=3&&cached[consumed]==0&&size==game.fileSize&&mtime==game.modified&&(id>>48)==0x0005){
+        game.titleId=(uint64_t)id;
+        if(parsed==4) game.fingerprint=(uint64_t)fingerprint;
+      }
+    }
+
+    auto titleCache=cemu_loadTitleCache(std::string(DATA_DIR)+"/title_list_cache.xml");
+    if(!game.titleId) game.titleId=cemu_resolveBaseTitleId(directPath,titleCache,&game.titleIdError);
+    if(!isDirectory&&!game.fingerprint) game.fingerprint=fingerprintGameFile(directPath,info);
+    if(isDirectory&&!game.fingerprint) game.fingerprint=fingerprintGameDirectory(directPath,game.titleId);
+
+    Store refreshedIdentities=g_gameIdentities;
+    std::unordered_set<std::string> usedIdentities,reservedIds,reservedCanonicalPaths;
+    for(const KV &entry:refreshedIdentities.kv){
+      GameIdentityRecord record;
+      if(!parseIdentityRecord(entry,record)||record.retired) continue;
+      reservedIds.insert(record.key);
+      if(!record.canonicalPath.empty()&&identityPathExists(record)) reservedCanonicalPaths.insert(record.canonicalPath);
+    }
+    const std::string canonical=canonicalGamePath(directPath);
+    game.key=choosePersistentGameKey(refreshedIdentities,refreshedIdentities,usedIdentities,
+                                      reservedIds,reservedCanonicalPaths,
+                                      game.titleId,game.fingerprint,
+                                      identityFormat(directPath,isDirectory),canonical,directPath);
+    g_gameIdentities=std::move(refreshedIdentities);
+    storeSave(g_gameIdentities,GAME_IDENTITIES_INI);
+    migrateGameIdentity(game);
+
+    const char *custom=storeGet(g_titles,game.key.c_str(),"");
+    if(!custom[0]) custom=storeGet(g_titles,game.legacyKey.c_str(),"");
+    game.title=custom[0]?custom:cleanTitle(game.file);
+    game.region=detectRegion(game.file);
+    const char *played=storeGet(g_recent,game.key.c_str(),"");
+    if(!played[0]) played=storeGet(g_recent,game.legacyKey.c_str(),"0");
+    game.played=atoll(played);
+    game.hasCfg=gameFileExists(GAMECFG_DIR,game,".ini")||
+                regularFileExists(std::string(GAMECFG_DIR)+"/"+game.legacyKey+".ini");
+
+    if(!isDirectory&&game.titleId){
+      char cached[128];
+      snprintf(cached,sizeof(cached),"%lld,%lld,%016llx,%016llx",game.fileSize,game.modified,
+               (unsigned long long)game.titleId,(unsigned long long)game.fingerprint);
+      storeSet(g_containerTitles,game.key.c_str(),cached);
+      storeSet(g_containerTitles,game.legacyKey.c_str(),cached);
+      storeSave(g_containerTitles,CONTAINER_TITLES_INI);
+    }
+    selectGame(game);
+    return true;
+  };
+
+  bool forwarderRequested=silentDirectForwarder;
+  bool forwarderMatched=false;
+  bool forwarderDirectPath=silentDirectForwarder;
+  std::string forwarderKey=positionalForwarderPath;
+  auto findForwarderGame=[&]() -> Game* { return findGameByKey(forwarderKey); };
+
+  if(forwarderDirectPath) forwarderMatched=prepareDirectForwarderGame(forwarderKey);
+
+  // Preserve NaGaa's built-in -g <gameKey> behavior unchanged.
+  if(!forwarderRequested) for(int ai=1; ai+1<argc; ai++) if(strcmp(argv[ai],"-g")==0){
     forwarderRequested=true;
     forwarderKey=argv[ai+1];
-    if (Game *game = findGameByKey(forwarderKey)){ selectGame(*game); forwarderMatched=true; }
+    if(Game *game=findForwarderGame()){ selectGame(*game); forwarderMatched=true; }
     break;
   }
   if(!forwarderRequested&&g_griddbReady&&
@@ -7364,10 +7687,12 @@ int main(int argc, char **argv){
       usbGeneration=usbSnapshot.generation;
       gamePaths=loadGameSources();
       refreshConfiguredUsbSources(gamePaths);
-      std::vector<std::string> mountedSources;
-      for(const std::string &source:gamePaths)
-        if(isUsbStoragePath(source)||source.rfind("cemusmb_",0)==0) mountedSources.push_back(source);
-      pendingMountedSources=std::move(mountedSources);
+      if(!silentDirectForwarder){
+        std::vector<std::string> mountedSources;
+        for(const std::string &source:gamePaths)
+          if(isUsbStoragePath(source)||source.rfind("cemusmb_",0)==0) mountedSources.push_back(source);
+        pendingMountedSources=std::move(mountedSources);
+      }
     }
     if(hasUsbSource&&storageIntegrated){
       const Uint32 now=SDL_GetTicks();
@@ -7404,13 +7729,17 @@ int main(int argc, char **argv){
           const std::string id=usbStableIdForPath(source);
           if(!id.empty()&&needsScan.count(id)) changedUsbSources.push_back(source);
         }
-        if(!changedUsbSources.empty()) pendingMountedSources=std::move(changedUsbSources);
+        if(!silentDirectForwarder&&!changedUsbSources.empty()) pendingMountedSources=std::move(changedUsbSources);
         sel=0;
         if(!selected.empty()) for(size_t index=0;index<g_libraryView.size();index++) if(g_libraryView[index]->key==selected){ sel=(int)index; break; }
         top=0;
-        if(forwarderPending) if(Game *game=findGameByKey(forwarderKey)){
-          selectGame(*game);
-          forwarderPending=false;
+        if(forwarderPending){
+          if(forwarderDirectPath){
+            if(prepareDirectForwarderGame(forwarderKey)) forwarderPending=false;
+          } else if(Game *game=findForwarderGame()){
+            selectGame(*game);
+            forwarderPending=false;
+          }
         }
       }
       if(forwarderPending&&SDL_TICKS_PASSED(now,forwarderDeadline)){
@@ -7430,13 +7759,16 @@ int main(int argc, char **argv){
         }
       }
       if(!running) break;
-      if(Game *game=findGameByKey(forwarderKey)){
+      if(forwarderDirectPath){
+        if(prepareDirectForwarderGame(forwarderKey)){ forwarderPending=false; break; }
+      } else if(Game *game=findForwarderGame()){
         selectGame(*game);
         forwarderPending=false;
         break;
       }
-      renderUsbForwarderWait();
-    waitForNextUiFrame();
+      // Raw positional forwarders wait without presenting launcher UI.
+      if(!forwarderDirectPath) renderUsbForwarderWait();
+      waitForNextUiFrame();
       continue;
     }
     GLay L=gridLayout();

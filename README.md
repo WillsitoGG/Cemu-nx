@@ -1,3 +1,21 @@
+## WillsitoGG fork – changes
+
+This fork is kept as close to upstream as possible. The fork-specific work currently maintained here is:
+
+- Support for standard NSP forwarders that pass a Wii U game path directly through `argv[1]`.
+- Detection of the positional forwarder path before SDL/video initialization, allowing the direct-launch path to remain headless.
+- Direct preparation of title identity, per-game configuration and the launch handoff without creating the launcher window/grid first.
+- Preservation of the official embedded `cemu_core.nro` byte-for-byte, including headless first-run extraction/verification.
+- Preservation of the normal launcher flow and NaGaa's existing `-g <gameKey>` mechanism.
+- The source change is intentionally localized to `switch_launcher/source/main.cpp`.
+
+Development branch: [`fix/direct-forwarder`](https://github.com/WillsitoGG/Cemu-nx/tree/fix/direct-forwarder)  
+Upstream contribution: [NaGaa95/Cemu-nx#5](https://github.com/NaGaa95/Cemu-nx/pull/5)
+
+> The original upstream README continues below and is intentionally kept unchanged.
+
+---
+
 # **Cemu - Wii U emulator**
 
 [![Build Process](https://github.com/cemu-project/Cemu/actions/workflows/build.yml/badge.svg)](https://github.com/cemu-project/Cemu/actions/workflows/build.yml)

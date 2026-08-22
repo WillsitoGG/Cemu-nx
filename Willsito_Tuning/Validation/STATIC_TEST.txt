@@ -1,0 +1,5 @@
+PASS: positional argv[1] branches before SDL/video initialization
+PASS: headless branch contains no launcher UI initialization/render calls
+PASS: first-run core extraction cannot render Preparing emulator before SDL
+PASS: headless branch writes handoff and arms cemu_core.nro chainload
+PASS: normal launcher and NaGaa -g parser remain after the headless branch
