@@ -15,6 +15,9 @@ src=src.replace('OUT="${OUT:-$ROOT/cemu-fix-build-output}"',
                 'OUT="${OUT:-$ROOT/cemu-v1-build-output}"',1)
 src=src.replace('WORK="${WORK:-/work/cemu-direct-forwarder-fix}"',
                 'WORK="${WORK:-/work/cemu-direct-forwarder-v1}"',1)
+# The permanent v2 builder embeds its work path in Python/CMake snippets too.
+# Rewrite every remaining embedded occurrence so the v1 reproduction is self-consistent.
+src=src.replace('/work/cemu-direct-forwarder-fix','/work/cemu-direct-forwarder-v1')
 src=src.replace('EXPECTED_SOURCE_BLOB="8a40edb75434fbef0ed8a854264b77ab11d049dd"',
                 'EXPECTED_SOURCE_BLOB="1ab55ef775dc44fb0897f6720ffcc945d134ca1d"',1)
 
